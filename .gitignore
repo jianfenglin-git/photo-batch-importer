@@ -1,0 +1,27 @@
+# Swift Package Manager build artifacts
+.build/
+.swiftpm/
+Package.resolved
+
+# Produced app bundle
+build/
+
+# Signing material — never commit (esp. if the repo is public for Pages).
+# Certificates + provisioning profile live here; private keys stay in the
+# keychain. Regenerate/redownload from the Apple Developer portal as needed.
+certs/
+*.pkg
+*.provisionprofile
+*.cer
+*.p12
+
+# Generated icon intermediate (source PNG is kept; .icns rebuilt on demand)
+Resources/AppIcon.iconset/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

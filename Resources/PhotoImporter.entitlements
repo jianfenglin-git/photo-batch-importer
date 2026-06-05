@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Dev entitlements: NO sandbox.
+
+         Under the App Sandbox, `FileManager.enumerator(at: /Volumes/Card)`
+         silently returns zero items without the user granting access via
+         NSOpenPanel first. Our "click card → auto-scan" UX doesn't do that
+         grant dance, so sandboxed dev builds stay stuck on "Scanning…".
+
+         The MAS submission path lives at PhotoImporter.mas.entitlements:
+         turn sandbox back on + keep iCloud, and implement an explicit
+         "grant access to the card" NSOpenPanel flow for the MAS build.
+
+         For now, leave this file empty-ish so dev builds run with full
+         filesystem access and Cloud-KV still works via the local
+         UserDefaults fallback our CloudKVStore uses.
+    -->
+</dict>
+</plist>

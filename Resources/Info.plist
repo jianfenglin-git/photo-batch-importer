@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Photo Batch Importer</string>
+    <key>CFBundleIconFile</key>
+    <string>PhotoImporter</string>
+    <key>CFBundleIconName</key>
+    <string>PhotoImporter</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.jianfenglin.photoimporter</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Photo Batch Importer</string>
+    <key>CFBundleDisplayName</key>
+    <string>Photo Batch Importer</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.1</string>
+    <key>CFBundleVersion</key>
+    <string>6</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.photography</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Photo Batch Importer reads photos from SD/CF cards and other removable volumes.</string>
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+</dict>
+</plist>
