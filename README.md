@@ -108,6 +108,8 @@ Upload: install **Transporter** (free, Mac App Store), sign in, drag in
 `build/Photo Batch Importer.pkg`, **Deliver**. Each re-upload needs a unique,
 increasing `CFBundleVersion` in `Resources/Info.plist`.
 
+This app has been published to macOS App Store and you can install directly from there.
+
 ## Project layout
 
 ```
