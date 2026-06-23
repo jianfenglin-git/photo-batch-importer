@@ -431,29 +431,42 @@ private struct TemplateRuleRow: View {
 }
 
 /// Per-rule "Backup folder…" button. Click opens a folder picker; once a
-/// folder is set the button shows the path (truncated middle). Right-click
-/// / long-press gives a context menu to clear the selection.
+/// folder is set the button shows the path (truncated middle) and an inline
+/// ✕ button appears to clear the selection. A right-click / long-press
+/// context menu offers the same actions.
 private struct BackupFolderButton: View {
     let index: Int
     @EnvironmentObject private var vm: AppViewModel
 
     var body: some View {
         let folder = vm.rules[index].backupFolder
-        Button(action: { vm.pickBackupFolder(forRuleAt: index) }) {
-            Text(folder?.displayPath ?? "Backup folder…")
-                .font(.system(size: 11, design: folder == nil ? .default : .monospaced))
-                .foregroundStyle(folder == nil ? .secondary : .primary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 90, alignment: .leading)
-        }
-        .controlSize(.small)
-        .help(folder?.displayPath ?? "Choose a folder to mirror every copied file into (same relative path under a different root)")
-        .contextMenu {
-            Button("Choose folder…") { vm.pickBackupFolder(forRuleAt: index) }
+        HStack(spacing: 2) {
+            Button(action: { vm.pickBackupFolder(forRuleAt: index) }) {
+                Text(folder?.displayPath ?? "Backup folder…")
+                    .font(.system(size: 11, design: folder == nil ? .default : .monospaced))
+                    .foregroundStyle(folder == nil ? .secondary : .primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: folder == nil ? 90 : 72, alignment: .leading)
+            }
+            .controlSize(.small)
+            .help(folder?.displayPath ?? "Choose a folder to mirror every copied file into (same relative path under a different root)")
+            .contextMenu {
+                Button("Choose folder…") { vm.pickBackupFolder(forRuleAt: index) }
+                if folder != nil {
+                    Divider()
+                    Button("Clear backup folder") { vm.clearBackupFolder(forRuleAt: index) }
+                }
+            }
+
             if folder != nil {
-                Divider()
-                Button("Clear backup folder") { vm.clearBackupFolder(forRuleAt: index) }
+                Button(action: { vm.clearBackupFolder(forRuleAt: index) }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Remove backup folder (no backup for this rule)")
             }
         }
     }

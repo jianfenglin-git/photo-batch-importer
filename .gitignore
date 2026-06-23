@@ -17,6 +17,7 @@ certs/
 
 # Generated icon intermediate (source PNG is kept; .icns rebuilt on demand)
 Resources/AppIcon.iconset/
+private/
 
 # macOS
 .DS_Store
