@@ -428,9 +428,17 @@ final class AppViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
         panel.message = "Choose backup folder for \(rules[index].fileType.label) files"
-        if panel.runModal() == .OK, let url = panel.url, let ref = FolderRef(url: url) {
-            rules[index].backupFolder = ref
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let ref = FolderRef(url: url) else {
+            // Unlike the card scan, a backup folder is resolved LATER (at
+            // import, possibly after a relaunch), so it must persist as a
+            // bookmark — there's no session-only fallback. When macOS refuses
+            // to mint one (the macOS 26 volume-root bug), tell the user
+            // instead of silently dropping the choice.
+            Self.warnBookmarkFailed(url: url, role: "backup folder")
+            return
         }
+        rules[index].backupFolder = ref
     }
 
     func clearBackupFolder(forRuleAt index: Int) {
@@ -496,31 +504,94 @@ final class AppViewModel: ObservableObject {
                 + "Keep this card selected and click Grant Access."
             panel.prompt = "Grant Access"
             self.needsCardAccess = false
-            guard panel.runModal() == .OK, let url = panel.url, let ref = FolderRef(url: url) else {
-                // User cancelled the panel: drop back to a neutral state so the
-                // card looks unselected rather than stuck "Scanning…".
+            guard panel.runModal() == .OK, let url = panel.url else {
+                // Genuine cancel (Escape / Cancel button): drop back to a
+                // neutral state so the card looks unselected rather than
+                // stuck "Scanning…".
                 guard self.selectedVolume?.id == v.id else { return }
                 self.selectedVolume = nil
                 self.photos = []
                 self.selectedPaths = []
                 return
             }
-            self.cardAccessStore.store(ref, forMountPath: v.mountPoint.path)
+            // The user granted access. `url` is now readable for this session
+            // via the Powerbox grant — that's all we need to scan RIGHT NOW.
+            //
+            // Persisting a security-scoped bookmark (so future inserts skip
+            // this panel) is a SEPARATE step, and on macOS 26 it needs the
+            // DCIM workaround — see `persistableCardRef`.
+            let storedRef = self.persistableCardRef(rootURL: url)
+            if let storedRef {
+                self.cardAccessStore.store(storedRef, forMountPath: v.mountPoint.path)
+            }
             // The volume could have changed while the panel was up; only scan
             // if this card is still the selected one.
             guard self.selectedVolume?.id == v.id else { return }
             self.scanError = nil
             self.scanning = true
-            self.scan(volume: v, access: self.cardAccessStore.resolve(forMountPath: v.mountPoint.path))
+            // Scan through the SAME scope we persisted, so this session's photo
+            // list matches exactly what a later import (which re-resolves the
+            // stored bookmark) can re-open. Resolving the just-stored bookmark
+            // also proves it works now rather than failing silently next time.
+            // When nothing could be persisted, fall back to the live root grant
+            // for this session only.
+            let access = storedRef != nil
+                ? self.cardAccessStore.resolve(forMountPath: v.mountPoint.path)
+                : FolderRef.Resolved(
+                    url: url,
+                    stale: false,
+                    needsStop: url.startAccessingSecurityScopedResource()
+                )
+            self.scan(volume: v, access: access)
         }
+    }
+
+    /// Build the security-scoped bookmark to persist for a card the user just
+    /// granted access to at `rootURL` (currently live via the Open panel's
+    /// Powerbox grant).
+    ///
+    /// Prefers bookmarking the exact folder granted — the card root — which is
+    /// what happens on macOS 15 and macOS 26.2+. On macOS 26.0–26.1,
+    /// `bookmarkData(.withSecurityScope)` fails for a FAT/exFAT *volume root*
+    /// (Apple r.157722315; SD/CF cards are FAT/exFAT), yet a *subfolder* still
+    /// bookmarks AND resolves fine — which also sidesteps the separate
+    /// "/.nofollow" root-resolution bug. Cameras follow the DCF standard and
+    /// write under `DCIM`, so we fall back to scoping DCIM: enough to re-open
+    /// every camera photo after a remount without re-prompting.
+    ///
+    /// Returns nil only when neither can be bookmarked (root bug active AND no
+    /// DCIM on the card). The caller then keeps working via the live in-session
+    /// grant and re-prompts on the next insert — i.e. no worse than before.
+    private func persistableCardRef(rootURL: URL) -> FolderRef? {
+        // A child bookmark can only be minted while the parent scope is live.
+        let didStart = rootURL.startAccessingSecurityScopedResource()
+        defer { if didStart { rootURL.stopAccessingSecurityScopedResource() } }
+
+        // Preferred: the granted root. Works everywhere except the 26.0–26.1 bug.
+        if let ref = FolderRef(url: rootURL) { return ref }
+
+        // Fallback: the DCF-standard DCIM folder, which bookmarks fine even when
+        // the volume root won't on the affected macOS 26 seeds.
+        let dcim = rootURL.appendingPathComponent("DCIM", isDirectory: true)
+        if FileManager.default.fileExists(atPath: dcim.path) {
+            return FolderRef(url: dcim)
+        }
+        return nil
     }
 
     /// Scan `volume`, holding the security-scoped access token (if any) alive
     /// for the duration so sandboxed reads succeed, then releasing it.
     private func scan(volume v: Volume, access: FolderRef.Resolved?) {
         let mount = v.mountPoint
+        // Walk from the exact folder we hold scope for. Normally that's the
+        // card root. On macOS 26.0–26.1 the persisted grant is the card's DCIM
+        // subfolder (root bookmarks fail on FAT/exFAT — see persistableCardRef),
+        // and the sandbox only lets us enumerate inside the scoped folder, so
+        // scanning `mount` there would return nothing. DCIM is where the DCF
+        // standard puts camera photos, so this still finds them all.
+        let scanRoot = access?.url ?? mount
         scanTask = Task.detached(priority: .userInitiated) { [weak self, access] in
-            let found = PhotoScanner.scan(at: mount)
+            let found = PhotoScanner.scan(at: scanRoot)
             // Keep `access` alive across the scan; stop the scope now that
             // file enumeration + metadata reads are done.
             access?.stop()
@@ -595,9 +666,33 @@ final class AppViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
         panel.message = "Choose destination folder"
-        if panel.runModal() == .OK, let url = panel.url, let ref = FolderRef(url: url) {
-            destination = ref
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let ref = FolderRef(url: url) else {
+            // Destination is resolved at import time (see startImport), so it
+            // must persist as a bookmark — no session-only fallback. Surface
+            // the macOS 26 volume-root bookmark failure rather than silently
+            // leaving the destination unset.
+            Self.warnBookmarkFailed(url: url, role: "destination folder")
+            return
         }
+        destination = ref
+    }
+
+    /// Explain, via a modal alert, that macOS refused to create a persistent
+    /// security-scoped bookmark for `url`. Hit primarily on macOS 26 when a
+    /// *volume root* is chosen (Apple FB20186406); choosing a normal subfolder
+    /// on the same volume works. Kept generic so both folder pickers share it.
+    private static func warnBookmarkFailed(url: URL, role: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn’t save access to this \(role)"
+        alert.informativeText = """
+        macOS wouldn’t grant Photo Batch Importer lasting access to “\(url.lastPathComponent)”. \
+        This usually happens when the top level of a disk is chosen on macOS 26. \
+        Please pick a folder inside the disk instead (you can make a new one in the dialog).
+        """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - Presets
