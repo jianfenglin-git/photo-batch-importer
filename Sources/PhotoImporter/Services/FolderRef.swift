@@ -35,7 +35,7 @@ struct FolderRef: Hashable, Codable {
     /// Resolve the bookmark back into a URL + start security-scoped access.
     /// The returned `Resolved` token must be kept alive during I/O, then
     /// released via `.stop()` (which calls `stopAccessingSecurityScopedResource`).
-    func resolve() -> Resolved? {
+    func resolve(requireSecurityScope: Bool = false) -> Resolved? {
         var stale = false
         guard let url = try? URL(
             resolvingBookmarkData: bookmark,
@@ -46,6 +46,11 @@ struct FolderRef: Hashable, Codable {
             return nil
         }
         let started = url.startAccessingSecurityScopedResource()
+        // Card access always requires a live dynamic sandbox extension, while
+        // a general folder bookmark may point somewhere the app can already
+        // access (for example inside its own container). Let those callers opt
+        // into the stricter check instead of rejecting every false return.
+        guard !requireSecurityScope || started || !Sandbox.isActive else { return nil }
         return Resolved(url: url, stale: stale, needsStop: started)
     }
 

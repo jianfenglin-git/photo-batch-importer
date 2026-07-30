@@ -42,12 +42,31 @@ final class CardAccessStore {
     /// dead entry is dropped so the UI re-prompts cleanly.
     func resolve(forMountPath mountPath: String) -> FolderRef.Resolved? {
         guard let ref = refs[mountPath] else { return nil }
-        guard let resolved = ref.resolve() else {
+        guard let resolved = ref.resolve(requireSecurityScope: true),
+              Self.resolvedURL(resolved.url, matchesStoredPath: ref.displayPath),
+              Self.canEnumerateDirectory(resolved.url)
+        else {
             refs[mountPath] = nil
             persist()
             return nil
         }
         return resolved
+    }
+
+    /// Tahoe 26.1 can resolve a valid removable-volume bookmark to a bogus
+    /// `/.nofollow` child after remounting. Card bookmarks are deliberately
+    /// tied to their original path (the store is mount-path keyed), so any
+    /// changed target is invalid and must trigger a fresh Powerbox grant.
+    nonisolated static func resolvedURL(_ resolvedURL: URL, matchesStoredPath storedPath: String) -> Bool {
+        resolvedURL.standardizedFileURL.path == URL(fileURLWithPath: storedPath).standardizedFileURL.path
+    }
+
+    nonisolated static func canEnumerateDirectory(_ url: URL) -> Bool {
+        (try? FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) != nil
     }
 
     private func persist() {

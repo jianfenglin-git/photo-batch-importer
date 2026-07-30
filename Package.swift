@@ -23,16 +23,11 @@ let package = Package(
                 ])
             ]
         ),
-        // Tests use `swift-testing`, which ships with Xcode but NOT with the
-        // plain Command Line Tools. If you want to run tests, install Xcode
-        // and re-enable this target — the test sources under
-        // Tests/PhotoImporterTests stay in the tree either way.
-        //
-        // .testTarget(
-        //     name: "PhotoImporterTests",
-        //     dependencies: ["PhotoImporter"],
-        //     path: "Tests/PhotoImporterTests",
-        //     resources: [.copy("Fixtures")]
-        // ),
+        .testTarget(
+            name: "PhotoImporterTests",
+            dependencies: ["PhotoImporter"],
+            path: "Tests/PhotoImporterTests",
+            resources: [.copy("Fixtures")]
+        ),
     ]
 )

@@ -7,11 +7,14 @@ private func photo(path: String, date: Date? = nil, cameraModel: String? = "Cano
         date: date,
         cameraMake: "Canon",
         cameraModel: cameraModel,
+        cameraSerial: nil,
+        cameraOwner: nil,
         lens: nil,
         iso: 400,
         shutter: nil,
         aperture: nil,
         focalLength: nil,
+        subSecond: nil,
         fromExif: date != nil
     )
     meta.fromExif = true

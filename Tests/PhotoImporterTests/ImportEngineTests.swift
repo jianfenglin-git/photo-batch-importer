@@ -13,11 +13,17 @@ private func photo(path: String, date: (Int, Int, Int), size: Int64 = 100) -> Ph
         sizeBytes: size,
         meta: PhotoMeta(
             date: when,
-            cameraMake: nil, cameraModel: nil, lens: nil,
+            cameraMake: nil, cameraModel: nil, cameraSerial: nil, cameraOwner: nil,
+            lens: nil,
             iso: nil, shutter: nil, aperture: nil, focalLength: nil,
+            subSecond: nil,
             fromExif: true
         )
     )
+}
+
+private func allRule(_ segments: [TemplateSegment]) -> [CompiledRule] {
+    [CompiledRule(fileType: .all, segments: segments, backupFolder: nil)]
 }
 
 private func tempDir() -> URL {
@@ -37,7 +43,7 @@ struct ImportEngineTests {
         let tmpl = try Template.parse("{seq:0000}_{file.name}")
         let plan = ImportEngine.plan(
             photos: photos,
-            segments: tmpl,
+            rules: allRule(tmpl),
             destination: URL(fileURLWithPath: "/out"),
             cardLabel: "CARD",
             seqStart: 1
@@ -56,7 +62,7 @@ struct ImportEngineTests {
         let tmpl = try Template.parse("IMG_{seq:000000}.{file.ext}")
         let plan = ImportEngine.plan(
             photos: photos,
-            segments: tmpl,
+            rules: allRule(tmpl),
             destination: URL(fileURLWithPath: "/out"),
             cardLabel: "CARD",
             seqStart: 1
@@ -72,7 +78,7 @@ struct ImportEngineTests {
         let tmpl = try Template.parse("IMG_{seq:000000}.{file.ext}")
         let plan = ImportEngine.plan(
             photos: photos,
-            segments: tmpl,
+            rules: allRule(tmpl),
             destination: URL(fileURLWithPath: "/out"),
             cardLabel: "CARD",
             seqStart: 1
@@ -92,7 +98,7 @@ struct ImportEngineTests {
             seq: 1, sizeBytes: 4
         )
         let plan = ImportPlan(items: [item], totalBytes: 4)
-        let result = ImportEngine.execute(
+        let result = ImportEngine.executePrimary(
             plan: plan,
             options: ImportOptions(collisionPolicy: .skipSameHash, verify: false),
             onProgress: { _ in }
@@ -111,7 +117,7 @@ struct ImportEngineTests {
             items: [ImportItem(src: src, dst: dst, seq: 1, sizeBytes: 4)],
             totalBytes: 4
         )
-        let r = ImportEngine.execute(
+        let r = ImportEngine.executePrimary(
             plan: plan,
             options: ImportOptions(collisionPolicy: .skipSameHash, verify: false),
             onProgress: { _ in }
@@ -129,7 +135,7 @@ struct ImportEngineTests {
             items: [ImportItem(src: src, dst: dst, seq: 1, sizeBytes: 9)],
             totalBytes: 9
         )
-        let r = ImportEngine.execute(
+        let r = ImportEngine.executePrimary(
             plan: plan,
             options: ImportOptions(collisionPolicy: .skipSameHash, verify: true),
             onProgress: { _ in }
@@ -138,5 +144,26 @@ struct ImportEngineTests {
         #expect(r.verified == 1)
         #expect(r.verifyFailed == 0)
         #expect(FileManager.default.fileExists(atPath: src.path))
+    }
+
+    @Test func overwriteTruncatesLongerDestination() throws {
+        let d = tempDir()
+        let src = d.appendingPathComponent("src.bin")
+        let dst = d.appendingPathComponent("dst.bin")
+        try Data("new".utf8).write(to: src)
+        try Data("old-data-that-is-longer".utf8).write(to: dst)
+        let plan = ImportPlan(
+            items: [ImportItem(src: src, dst: dst, seq: 1, sizeBytes: 3)],
+            totalBytes: 3
+        )
+
+        let result = ImportEngine.executePrimary(
+            plan: plan,
+            options: ImportOptions(collisionPolicy: .overwrite, verify: false),
+            onProgress: { _ in }
+        )
+
+        #expect(result.overwritten == 1)
+        #expect(try Data(contentsOf: dst) == Data("new".utf8))
     }
 }

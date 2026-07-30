@@ -249,11 +249,24 @@ enum ImportEngine {
     /// `hashFile(dst)` run afterwards gives a true end-to-end integrity
     /// check when verify is enabled.
     private static func streamingCopyAndHash(src: URL, dst: URL) throws -> Data {
+        let fm = FileManager.default
         let reader = try FileHandle(forReadingFrom: src)
         defer { try? reader.close() }
-        FileManager.default.createFile(atPath: dst.path, contents: nil)
+        if !fm.fileExists(atPath: dst.path) {
+            guard fm.createFile(atPath: dst.path, contents: nil) else {
+                throw NSError(
+                    domain: "PhotoImporter.copy",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "could not create destination file"]
+                )
+            }
+        }
         let writer = try FileHandle(forWritingTo: dst)
         defer { try? writer.close() }
+        // FileHandle writes from offset zero but does not discard old trailing
+        // bytes. Without truncation, overwriting a large file with a smaller
+        // photo produces a corrupt destination whenever Verify is disabled.
+        try writer.truncate(atOffset: 0)
 
         var hasher = SHA256()
         while true {

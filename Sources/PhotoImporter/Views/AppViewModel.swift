@@ -94,6 +94,7 @@ final class AppViewModel: ObservableObject {
 
     // Runtime state that isn't published to the UI
     private var scanTask: Task<Void, Never>?
+    private var scanGeneration = UUID()
     private var destinationsTask: Task<Void, Never>?
     private var runOptions: RunOptions?
     private var eligibleSources: [URL] = []
@@ -199,10 +200,13 @@ final class AppViewModel: ObservableObject {
                 self.volumes = newList
                 if let current = self.selectedVolume,
                    !newList.contains(where: { $0.id == current.id }) {
+                    self.scanTask?.cancel()
+                    self.scanGeneration = UUID()
                     self.selectedVolume = nil
                     self.photos = []
                     self.selectedPaths = []
                     self.needsCardAccess = false
+                    self.scanning = false
                 }
             }
             .store(in: &cancellables)
@@ -388,10 +392,12 @@ final class AppViewModel: ObservableObject {
     ///   bookmark is resolved and its URL is used (for actual imports).
     ///   When false, the displayPath is used directly (for preview-only).
     ///   Returns the list of `FolderRef.Resolved` tokens alongside so the
-    ///   caller can keep them alive (they auto-stop on deinit).
-    func compiledRules(resolveBookmarks: Bool = false) -> ([CompiledRule], [FolderRef.Resolved]) {
+    ///   caller can keep them alive (they auto-stop on deinit), plus any
+    ///   configured backup paths that failed to resolve.
+    func compiledRules(resolveBookmarks: Bool = false) -> ([CompiledRule], [FolderRef.Resolved], [String]) {
         var compiled: [CompiledRule] = []
         var tokens: [FolderRef.Resolved] = []
+        var unresolvedBackups: [String] = []
         for rule in rules {
             guard rule.isActive, let segs = try? Template.parse(rule.template) else { continue }
             var backupURL: URL? = nil
@@ -400,10 +406,9 @@ final class AppViewModel: ObservableObject {
                     if let resolved = ref.resolve() {
                         tokens.append(resolved)
                         backupURL = resolved.url
+                    } else {
+                        unresolvedBackups.append(ref.displayPath)
                     }
-                    // If resolve failed, the backup silently skips for
-                    // that rule — primary copy still happens. UI shows
-                    // the bookmark path so the user can re-pick.
                 } else {
                     backupURL = URL(fileURLWithPath: ref.displayPath)
                 }
@@ -414,7 +419,7 @@ final class AppViewModel: ObservableObject {
                 backupFolder: backupURL
             ))
         }
-        return (compiled, tokens)
+        return (compiled, tokens, unresolvedBackups)
     }
 
     /// Open an NSOpenPanel and set the selected folder as the backup folder
@@ -458,7 +463,10 @@ final class AppViewModel: ObservableObject {
     // MARK: - Card selection + scan
 
     func selectVolume(_ v: Volume) {
-        if selectedVolume?.id == v.id { return }
+        // A second click is also an explicit retry. This matters after a
+        // transient card/read error and when a card is rapidly remounted at
+        // the same `/Volumes/...` path.
+        if selectedVolume?.id == v.id && scanning { return }
         selectedVolume = v
         photos = []
         selectedPaths = []
@@ -466,6 +474,8 @@ final class AppViewModel: ObservableObject {
         scanError = nil
         needsCardAccess = false
         scanTask?.cancel()
+        scanGeneration = UUID()
+        scanning = false
 
         // Under the sandbox, reading the card requires a user grant persisted
         // as a security-scoped bookmark. Try a stored grant first; if none
@@ -503,8 +513,9 @@ final class AppViewModel: ObservableObject {
             panel.message = "Allow Photo Batch Importer to read photos from “\(v.label)”. "
                 + "Keep this card selected and click Grant Access."
             panel.prompt = "Grant Access"
+            let response = panel.runModal()
             self.needsCardAccess = false
-            guard panel.runModal() == .OK, let url = panel.url else {
+            guard response == .OK, let url = panel.url else {
                 // Genuine cancel (Escape / Cancel button): drop back to a
                 // neutral state so the card looks unselected rather than
                 // stuck "Scanning…".
@@ -512,6 +523,7 @@ final class AppViewModel: ObservableObject {
                 self.selectedVolume = nil
                 self.photos = []
                 self.selectedPaths = []
+                self.scanning = false
                 return
             }
             // The user granted access. `url` is now readable for this session
@@ -520,7 +532,7 @@ final class AppViewModel: ObservableObject {
             // Persisting a security-scoped bookmark (so future inserts skip
             // this panel) is a SEPARATE step, and on macOS 26 it needs the
             // DCIM workaround — see `persistableCardRef`.
-            let storedRef = self.persistableCardRef(rootURL: url)
+            let storedRef = self.persistableCardRef(grantedURL: url, volumeMount: v.mountPoint)
             if let storedRef {
                 self.cardAccessStore.store(storedRef, forMountPath: v.mountPoint.path)
             }
@@ -532,7 +544,8 @@ final class AppViewModel: ObservableObject {
             // Scan through the SAME scope we persisted, so this session's photo
             // list matches exactly what a later import (which re-resolves the
             // stored bookmark) can re-open. Resolving the just-stored bookmark
-            // also proves it works now rather than failing silently next time.
+            // catches immediate failures; Tahoe's remount-only failure is
+            // avoided separately by preferring DCIM on 26.0–26.1 below.
             // When nothing could be persisted, fall back to the live root grant
             // for this session only.
             let access = storedRef != nil
@@ -547,36 +560,75 @@ final class AppViewModel: ObservableObject {
     }
 
     /// Build the security-scoped bookmark to persist for a card the user just
-    /// granted access to at `rootURL` (currently live via the Open panel's
+    /// granted access to at `grantedURL` (currently live via the Open panel's
     /// Powerbox grant).
     ///
     /// Prefers bookmarking the exact folder granted — the card root — which is
     /// what happens on macOS 15 and macOS 26.2+. On macOS 26.0–26.1,
-    /// `bookmarkData(.withSecurityScope)` fails for a FAT/exFAT *volume root*
-    /// (Apple r.157722315; SD/CF cards are FAT/exFAT), yet a *subfolder* still
-    /// bookmarks AND resolves fine — which also sidesteps the separate
-    /// "/.nofollow" root-resolution bug. Cameras follow the DCF standard and
+    /// a FAT/exFAT *volume-root* bookmark may fail to mint or may resolve to
+    /// `/.nofollow` after remounting. A *subfolder* bookmark still works.
+    /// Cameras follow the DCF standard and
     /// write under `DCIM`, so we fall back to scoping DCIM: enough to re-open
     /// every camera photo after a remount without re-prompting.
     ///
     /// Returns nil only when neither can be bookmarked (root bug active AND no
     /// DCIM on the card). The caller then keeps working via the live in-session
     /// grant and re-prompts on the next insert — i.e. no worse than before.
-    private func persistableCardRef(rootURL: URL) -> FolderRef? {
+    private func persistableCardRef(grantedURL: URL, volumeMount: URL) -> FolderRef? {
         // A child bookmark can only be minted while the parent scope is live.
-        let didStart = rootURL.startAccessingSecurityScopedResource()
-        defer { if didStart { rootURL.stopAccessingSecurityScopedResource() } }
+        let didStart = grantedURL.startAccessingSecurityScopedResource()
+        defer { if didStart { grantedURL.stopAccessingSecurityScopedResource() } }
 
-        // Preferred: the granted root. Works everywhere except the 26.0–26.1 bug.
-        if let ref = FolderRef(url: rootURL) { return ref }
+        let selectedVolumeRoot = CardAccessStore.resolvedURL(grantedURL, matchesStoredPath: volumeMount.path)
+        let dcim = Self.dcimFolder(under: grantedURL)
+
+        // On Tahoe 26.0–26.1 a volume-root bookmark may be created and even
+        // resolve correctly during this session, then resolve to `/.nofollow`
+        // after the card is remounted. Prefer a child bookmark proactively on
+        // those releases; Apple fixed the root behavior in macOS 26.2.
+        if selectedVolumeRoot, Self.needsTahoeVolumeBookmarkWorkaround(),
+           let dcim, let ref = Self.validatedCardRef(url: dcim) {
+            return ref
+        }
+
+        // Preferred everywhere else: the exact folder granted by the user.
+        if let ref = Self.validatedCardRef(url: grantedURL) { return ref }
 
         // Fallback: the DCF-standard DCIM folder, which bookmarks fine even when
         // the volume root won't on the affected macOS 26 seeds.
-        let dcim = rootURL.appendingPathComponent("DCIM", isDirectory: true)
-        if FileManager.default.fileExists(atPath: dcim.path) {
-            return FolderRef(url: dcim)
+        if let dcim, let ref = Self.validatedCardRef(url: dcim) {
+            return ref
         }
         return nil
+    }
+
+    nonisolated static func needsTahoeVolumeBookmarkWorkaround(
+        _ version: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> Bool {
+        version.majorVersion == 26 && version.minorVersion < 2
+    }
+
+    private static func dcimFolder(under root: URL) -> URL? {
+        let children = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        return children?.first { child in
+            guard child.lastPathComponent.caseInsensitiveCompare("DCIM") == .orderedSame else { return false }
+            return (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+        }
+    }
+
+    private static func validatedCardRef(url: URL) -> FolderRef? {
+        guard let ref = FolderRef(url: url),
+              let resolved = ref.resolve(requireSecurityScope: true)
+        else { return nil }
+        defer { resolved.stop() }
+        guard CardAccessStore.resolvedURL(resolved.url, matchesStoredPath: url.path),
+              CardAccessStore.canEnumerateDirectory(resolved.url)
+        else { return nil }
+        return ref
     }
 
     /// Scan `volume`, holding the security-scoped access token (if any) alive
@@ -590,13 +642,15 @@ final class AppViewModel: ObservableObject {
         // scanning `mount` there would return nothing. DCIM is where the DCF
         // standard puts camera photos, so this still finds them all.
         let scanRoot = access?.url ?? mount
+        let generation = UUID()
+        scanGeneration = generation
         scanTask = Task.detached(priority: .userInitiated) { [weak self, access] in
+            defer { access?.stop() }
             let found = PhotoScanner.scan(at: scanRoot)
-            // Keep `access` alive across the scan; stop the scope now that
-            // file enumeration + metadata reads are done.
-            access?.stop()
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self = self else { return }
+                guard self.scanGeneration == generation else { return }
                 guard self.selectedVolume?.mountPoint == mount else { return }
                 self.photos = found
                 self.selectedPaths = Set(found.map { $0.id })
@@ -618,7 +672,7 @@ final class AppViewModel: ObservableObject {
             destinations = [:]
             return
         }
-        let (rulesCopy, _) = compiledRules(resolveBookmarks: false)
+        let (rulesCopy, _, _) = compiledRules(resolveBookmarks: false)
         guard !rulesCopy.isEmpty else {
             destinations = [:]
             return
@@ -901,7 +955,14 @@ final class AppViewModel: ObservableObject {
 
         importing = true
         progress = nil
-        let (compiled, scopeTokens) = compiledRules(resolveBookmarks: true)
+        let (compiled, scopeTokens, unresolvedBackups) = compiledRules(resolveBookmarks: true)
+        guard unresolvedBackups.isEmpty else {
+            scopeTokens.forEach { $0.stop() }
+            destResolved.stop()
+            importing = false
+            scanError = "Backup folder is no longer accessible — please re-select it: \(unresolvedBackups[0])"
+            return
+        }
         guard !compiled.isEmpty else {
             destResolved.stop()
             importing = false
@@ -922,6 +983,13 @@ final class AppViewModel: ObservableObject {
         // Hold the card's security scope (if sandboxed) for the whole import
         // so reading source files off the card succeeds. nil in dev builds.
         let cardAccess = cardAccessStore.resolve(forMountPath: volume.mountPoint.path)
+        guard cardAccess != nil || !Sandbox.isActive else {
+            scopeTokens.forEach { $0.stop() }
+            destResolved.stop()
+            importing = false
+            scanError = "Card access expired — click the card again and grant access before importing."
+            return
+        }
 
         // Capture the scope tokens in the closure so they stay alive for
         // the whole two-phase import; they auto-stop on deinit at the end.
@@ -952,10 +1020,10 @@ final class AppViewModel: ObservableObject {
             }
 
             // Phase 1: primary.
-            var localEligible: [URL] = []
+            var primaryEligible: Set<URL> = []
             let primaryResult = ImportEngine.executePrimary(plan: plan, options: options) { progress in
                 if progress.outcome.isEligibleForDelete {
-                    localEligible.append(progress.currentSrc)
+                    primaryEligible.insert(progress.currentSrc)
                 }
                 let snapshot = progress
                 Task { @MainActor in
@@ -972,6 +1040,7 @@ final class AppViewModel: ObservableObject {
             }
 
             // Phase 2: backup (re-reads source, not primary).
+            var backupEligible: Set<URL> = []
             if hasBackup {
                 await MainActor.run {
                     self?.currentPhase = .backup
@@ -983,6 +1052,9 @@ final class AppViewModel: ObservableObject {
                     self?.progress = nil
                 }
                 let backupResult = ImportEngine.executeBackup(plan: plan, options: options) { progress in
+                    if progress.outcome.isEligibleForDelete {
+                        backupEligible.insert(progress.currentSrc)
+                    }
                     let snapshot = progress
                     Task { @MainActor in
                         self?.progress = snapshot
@@ -999,6 +1071,14 @@ final class AppViewModel: ObservableObject {
             // through both phases.
             await MainActor.run {
                 guard let self = self else { return }
+                let sourcesRequiringBackup = Set(plan.items.compactMap { item in
+                    item.backupDst == nil ? nil : item.src
+                })
+                let localEligible = plan.items.compactMap { item -> URL? in
+                    guard primaryEligible.contains(item.src) else { return nil }
+                    guard !sourcesRequiringBackup.contains(item.src) || backupEligible.contains(item.src) else { return nil }
+                    return item.src
+                }
                 self.importing = false
                 self.currentPhase = nil
                 self.phaseMessage = "All done."
