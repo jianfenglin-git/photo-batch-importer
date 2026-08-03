@@ -12,7 +12,7 @@ small and fast.
 - Persistent monotonic sequence counter across runs.
 - Template-driven naming with properties for date, time, camera, lens, exposure,
   file name, sequence counter, card label.
-- Sor-table, multi-select photo table (Cmd/Shift-click for modifier select),
+- Sort-able, multi-select photo table (Cmd/Shift-click for modifier select),
   live "Destination file name" preview column.
 - Option to verify copied files with SHA-256 and confirm no data loss, 
 - JPG+RAW dual-format pair detection to use same sequence number for matching pairs.
