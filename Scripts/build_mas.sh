@@ -9,13 +9,21 @@
 #   - Apple WWDR G3 intermediate cert installed                  (chain)
 #   - A Mac App Store provisioning profile for the app's bundle id
 #
+# Full Xcode is NOT required. Without it:
+#   - the pre-compiled icon in Resources/CompiledIcon is used, after verifying
+#     it matches the icon source;
+#   - the universal binary is built per-arch with --triple and merged by lipo,
+#     rather than by xcbuild.
+#
 # Usage:
 #   Scripts/build_mas.sh
+#   Scripts/build_mas.sh --refresh-icon-cache   (full Xcode only; see below)
 #
 # Override autodetected values with env vars if needed:
 #   APP_IDENTITY="Apple Distribution: Jianfeng Lin (MA5JSLK6AZ)"
 #   PKG_IDENTITY="3rd Party Mac Developer Installer: Jianfeng Lin (MA5JSLK6AZ)"
 #   PROFILE="certs/Photo_Importer.provisionprofile"
+#   REFRESH_ICON_CACHE=1   same as --refresh-icon-cache
 #
 # Output:
 #   build/Photo Importer.app   (sandboxed, signed)
@@ -26,6 +34,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+for arg in "$@"; do
+    case "$arg" in
+        --refresh-icon-cache) REFRESH_ICON_CACHE=1 ;;
+        *) echo "error: unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
+
 APP_NAME="Photo Batch Importer"
 APP_DIR="build/${APP_NAME}.app"
 PKG_PATH="build/${APP_NAME}.pkg"
@@ -35,22 +50,35 @@ ICON_NAME="PhotoImporter"   # → Resources/PhotoImporter.icon (Icon Composer bu
 
 # --- Resolve signing identities -------------------------------------------
 # Autodetect from the keychain unless the caller pinned them via env vars.
+# The trailing `|| true` matters: with `set -e` + `pipefail`, grep finding no
+# match fails the whole substitution and kills the script *silently*, so the
+# actionable "no identity found" message below would never print — which is
+# exactly the case a fresh machine hits.
 if [[ -z "${APP_IDENTITY:-}" ]]; then
     APP_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-        | grep -o '"Apple Distribution: [^"]*"' | head -1 | tr -d '"')"
+        | grep -o '"Apple Distribution: [^"]*"' | head -1 | tr -d '"' || true)"
 fi
 if [[ -z "${PKG_IDENTITY:-}" ]]; then
     PKG_IDENTITY="$(security find-identity -v 2>/dev/null \
-        | grep -o '"3rd Party Mac Developer Installer: [^"]*"' | head -1 | tr -d '"')"
+        | grep -o '"3rd Party Mac Developer Installer: [^"]*"' | head -1 | tr -d '"' || true)"
 fi
 
-if [[ -z "$APP_IDENTITY" ]]; then
-    echo "error: no 'Apple Distribution' identity found in keychain." >&2
-    echo "       Import your distribution cert + WWDR G3 intermediate first." >&2
-    exit 1
-fi
-if [[ -z "$PKG_IDENTITY" ]]; then
-    echo "error: no '3rd Party Mac Developer Installer' identity found." >&2
+if [[ -z "$APP_IDENTITY" || -z "$PKG_IDENTITY" ]]; then
+    [[ -z "$APP_IDENTITY" ]] && echo "error: no 'Apple Distribution' identity in keychain." >&2
+    [[ -z "$PKG_IDENTITY" ]] && echo "error: no '3rd Party Mac Developer Installer' identity in keychain." >&2
+    echo >&2
+    echo "An identity = certificate + PRIVATE KEY. The .cer files in certs/ are only" >&2
+    echo "the public halves, so copying certs/ to a new machine is not enough." >&2
+    echo "Check what the keychain actually has:" >&2
+    echo "    security find-identity -v" >&2
+    echo >&2
+    echo "If it reports 0 identities:" >&2
+    echo "  - import a .p12 (cert + key exported together), or" >&2
+    echo "  - revoke + regenerate both certs from a new CSR at" >&2
+    echo "    https://developer.apple.com/account/resources/certificates" >&2
+    echo "    then re-create the provisioning profile (it embeds the dist cert)." >&2
+    echo "Also install the WWDR G3 intermediate, or valid certs still show as 0:" >&2
+    echo "    https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" >&2
     exit 1
 fi
 if [[ ! -f "$PROFILE" ]]; then
@@ -64,26 +92,51 @@ echo "› pkg identity: $PKG_IDENTITY"
 echo "› profile:      $PROFILE"
 
 # --- Build a release binary ------------------------------------------------
-# A universal (arm64 + x86_64) build needs xcbuild, which ships only with the
-# full Xcode. With Command Line Tools alone we fall back to a native-arch
-# build — Apple accepts single-architecture Mac App Store apps. Set
-# UNIVERSAL=0 to force native even when full Xcode is present.
-ARCH_FLAGS=()
-BUILD_KIND="native ($(uname -m))"
-if [[ "${UNIVERSAL:-1}" == "1" ]] \
-    && [[ -x "/Library/Developer/SharedFrameworks/XCBuild.framework/Versions/A/Support/xcbuild" ]]; then
-    ARCH_FLAGS=(--arch arm64 --arch x86_64)
-    BUILD_KIND="universal (arm64 + x86_64)"
+# Universal (arm64 + x86_64) without full Xcode: `swift build --arch a --arch b`
+# needs xcbuild, but building each slice on its own with `--triple` and merging
+# them with lipo produces an equivalent fat binary, and the Command Line Tools
+# SDK carries x86_64 stubs (SDKSettings SupportedTargets.macosx.Archs lists
+# x86_64 + arm64), so cross-compiling works. Set UNIVERSAL=0 for native only.
+#
+# The triples pin the same LSMinimumSystemVersion the app declares, so both
+# slices agree on minos — a mismatch there is an App Store rejection.
+MIN_OS_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Resources/Info.plist)"
+HOST_ARCH="$(uname -m)"
+
+if [[ "${UNIVERSAL:-1}" != "1" ]]; then
+    echo "› swift build -c release [native ($HOST_ARCH)]"
+    swift build -c release
+    BIN_PATH="$(swift build -c release --show-bin-path)/PhotoImporter"
+elif [[ -x "/Library/Developer/SharedFrameworks/XCBuild.framework/Versions/A/Support/xcbuild" ]]; then
+    # Full Xcode present: let SwiftPM build both slices in one invocation.
+    echo "› swift build -c release [universal (arm64 + x86_64), via xcbuild]"
+    swift build -c release --arch arm64 --arch x86_64
+    BIN_PATH="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/PhotoImporter"
+else
+    echo "› swift build -c release [universal (arm64 + x86_64), per-arch + lipo]"
+    SLICES=()
+    for arch in arm64 x86_64; do
+        triple="${arch}-apple-macosx${MIN_OS_BUILD}"
+        echo "  › $triple"
+        swift build -c release --triple "$triple"
+        slice="$(swift build -c release --triple "$triple" --show-bin-path)/PhotoImporter"
+        if [[ ! -f "$slice" ]]; then
+            echo "error: $arch slice not found at $slice" >&2
+            exit 1
+        fi
+        SLICES+=("$slice")
+    done
+    BIN_PATH="build/PhotoImporter-universal"
+    mkdir -p build
+    rm -f "$BIN_PATH"
+    lipo -create -output "$BIN_PATH" "${SLICES[@]}"
 fi
 
-echo "› swift build -c release [$BUILD_KIND]"
-swift build -c release ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"}
-
-BIN_PATH="$(swift build -c release ${ARCH_FLAGS[@]+"${ARCH_FLAGS[@]}"} --show-bin-path)/PhotoImporter"
 if [[ ! -f "$BIN_PATH" ]]; then
     echo "error: executable not found at $BIN_PATH" >&2
     exit 1
 fi
+echo "› binary archs: $(lipo -archs "$BIN_PATH")"
 
 # --- Assemble the .app bundle ---------------------------------------------
 echo "› assembling $APP_DIR"
@@ -105,8 +158,28 @@ cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
 #
 # The dyld "_kFig… missing symbol" warnings from running Xcode 26's actool on
 # macOS 15 are harmless (set to no-op) and don't affect output.
+#
+# When actool is unavailable (Command Line Tools only), fall back to the
+# pre-compiled artifacts in Resources/CompiledIcon — but only after confirming
+# they were built from the icon source that's on disk right now. A stale
+# Assets.car would ship the OLD artwork with a successful-looking build, which
+# is a worse failure than not building at all.
 ICON_SRC="Resources/${ICON_NAME}.icon"
-if [[ -d "$ICON_SRC" ]] && xcrun --find actool >/dev/null 2>&1; then
+ICON_CACHE="Resources/CompiledIcon"
+
+if [[ ! -d "$ICON_SRC" ]]; then
+    echo "error: icon source not found at $ICON_SRC" >&2
+    exit 1
+fi
+
+# Digest of every file in the .icon bundle, ignoring .DS_Store (Finder rewrites
+# it on mere folder views, which would otherwise invalidate a good cache).
+icon_source_digest() {
+    find "$ICON_SRC" -type f -not -name '.DS_Store' | sort \
+        | xargs shasum -a 256 | shasum -a 256 | awk '{print $1}'
+}
+
+if xcrun --find actool >/dev/null 2>&1; then
     echo "› actool: compiling $ICON_SRC"
     ICON_PARTIAL="build/icon-partial.plist"
     xcrun actool \
@@ -121,8 +194,37 @@ if [[ -d "$ICON_SRC" ]] && xcrun --find actool >/dev/null 2>&1; then
         echo "error: actool did not produce Assets.car — icon compile failed" >&2
         exit 1
     fi
+    # Refresh the checked-in cache so CLT-only machines can build this icon.
+    # Both artifacts and the digest are written together so they can't drift.
+    if [[ "${REFRESH_ICON_CACHE:-0}" == "1" ]]; then
+        echo "› refreshing $ICON_CACHE from actool output"
+        mkdir -p "$ICON_CACHE"
+        cp "$APP_DIR/Contents/Resources/Assets.car" "$ICON_CACHE/Assets.car"
+        if [[ -f "$APP_DIR/Contents/Resources/${ICON_NAME}.icns" ]]; then
+            cp "$APP_DIR/Contents/Resources/${ICON_NAME}.icns" "$ICON_CACHE/${ICON_NAME}.icns"
+        fi
+        icon_source_digest > "$ICON_CACHE/source.sha256"
+        xattr -cr "$ICON_CACHE"
+    fi
+elif [[ -f "$ICON_CACHE/Assets.car" && -f "$ICON_CACHE/source.sha256" ]]; then
+    CACHED_DIGEST="$(tr -d '[:space:]' < "$ICON_CACHE/source.sha256")"
+    ACTUAL_DIGEST="$(icon_source_digest)"
+    if [[ "$CACHED_DIGEST" != "$ACTUAL_DIGEST" ]]; then
+        echo "error: $ICON_CACHE is stale — $ICON_SRC has changed since it was compiled." >&2
+        echo "       cached: $CACHED_DIGEST" >&2
+        echo "       actual: $ACTUAL_DIGEST" >&2
+        echo "       Using it would silently ship the old icon. Rebuild on a machine with" >&2
+        echo "       full Xcode: REFRESH_ICON_CACHE=1 Scripts/build_mas.sh" >&2
+        exit 1
+    fi
+    echo "› actool unavailable — using verified pre-compiled icon from $ICON_CACHE"
+    cp "$ICON_CACHE/Assets.car" "$APP_DIR/Contents/Resources/Assets.car"
+    if [[ -f "$ICON_CACHE/${ICON_NAME}.icns" ]]; then
+        cp "$ICON_CACHE/${ICON_NAME}.icns" "$APP_DIR/Contents/Resources/${ICON_NAME}.icns"
+    fi
 else
-    echo "error: $ICON_SRC not found or actool unavailable (needs full Xcode)." >&2
+    echo "error: actool unavailable (needs full Xcode) and no pre-compiled icon at" >&2
+    echo "       $ICON_CACHE. See $ICON_CACHE/README.md." >&2
     exit 1
 fi
 
@@ -216,7 +318,7 @@ awk -v id="$BUNDLE_ID" -v ver="$SHORT_VER" \
 productbuild --distribution "$DIST" --package-path build \
     --sign "$PKG_IDENTITY" \
     "$PKG_PATH"
-rm -rf "$STAGE" "$COMPONENT_PKG"
+rm -rf "$STAGE" "$COMPONENT_PKG" build/PhotoImporter-universal
 
 echo
 echo "› done."

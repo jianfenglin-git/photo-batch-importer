@@ -14,13 +14,19 @@ small and fast.
   file name, sequence counter, card label.
 - Sort-able, multi-select photo table (Cmd/Shift-click for modifier select),
   live "Destination file name" preview column.
-- Option to verify copied files with SHA-256 and confirm no data loss, 
+- Option to verify every copied file against the source and confirm no data
+  loss, with a choice of digest: **SHA-256 (safer)** or **xxHash64 (faster)** —
+  xxHash64 computes roughly 2.7× faster, which saves ~18 s verifying a full
+  64 GB card. Either way the copy's byte count is checked against the source, so
+  a card pulled mid-copy is caught rather than silently verified as good.
 - JPG+RAW dual-format pair detection to use same sequence number for matching pairs.
 - Collision policies: skip-if-identical, rename, overwrite, skip-all.
 - Post-import deletion with confirmation to free up card space.
 - One-click eject (manual or automatic after import).
 - Free-space check before copying.
-- Settings saved to iCloud and sync-ed across devices.
+- Settings saved to iCloud and sync-ed across devices, with a warning under the
+  naming template when iCloud is unreachable and the template uses `{seq}` —
+  offline, the counter can't sync, so importing from two Macs could collide.
 
 ## Privacy
 
@@ -33,7 +39,7 @@ Three things go to the user's private iCloud (via NSUbiquitousKeyValueStore):
   The monotonic {seq} watermark — a single integer — so the counter keeps climbing across your devices.
 
   3. Import options (SyncedOptions, key options.v1)
-  Four behavior toggles: collisionPolicy, verify, deleteAfter, autoEject.
+  Five settings: collisionPolicy, verify, hashAlgorithm, deleteAfter, autoEject.
 
   What is NOT synced — stays device-local in UserDefaults (LocalFormState, key formState.v1):
   - activePresetID (which preset is currently selected)
@@ -94,11 +100,36 @@ One-time prerequisites in your login keychain / repo:
 - A **Mac App Store** provisioning profile at
   `certs/Photo_Importer.provisionprofile` (override with `PROFILE=…`).
 
+An *identity* is a certificate **plus its private key**. The `.cer` files in
+`certs/` are only the public halves — the keys were generated on the machine
+that made the CSR and live in that machine's keychain. `certs/` alone is
+therefore **not** a portable signing setup: after an OS reinstall or a move to
+a new Mac, either import a `.p12` (cert + key exported together) or revoke and
+regenerate from a fresh CSR. Note that the provisioning profile embeds the
+distribution certificate, so regenerating that cert also requires re-creating
+the profile.
+
 The script signs with the entitlements in `Resources/PhotoImporter.mas.entitlements`
-(App Sandbox + removable-volume RW for card auto-scan + user-selected RW +
-app-scope bookmarks + iCloud KV). It builds universal (arm64 + x86_64) when the
-full Xcode toolchain is present, otherwise native-arch (set `UNIVERSAL=0` to
-force native).
+(App Sandbox + user-selected RW + app-scope bookmarks + iCloud KV).
+
+It builds **universal (arm64 + x86_64)** by default. With full Xcode, xcbuild
+does both slices in one pass; without it, each slice is cross-compiled via
+`swift build --triple <arch>-apple-macosx<LSMinimumSystemVersion>` and merged
+with `lipo` — the Command Line Tools SDK carries x86_64 stubs, so no Xcode is
+needed. Deriving the triple from `LSMinimumSystemVersion` keeps both slices'
+`minos` in agreement, which the App Store requires. Set `UNIVERSAL=0` for a
+native-only build.
+
+**Full Xcode is not required.** `actool` (Xcode-only) compiles the Icon Composer
+`Resources/PhotoImporter.icon` into `Assets.car`; when it's unavailable the
+script uses the pre-compiled copy in `Resources/CompiledIcon`, but only after
+verifying its `source.sha256` still matches the icon source — a stale cache is
+rejected rather than silently shipping the old artwork. After editing the icon,
+regenerate the cache on a machine with full Xcode:
+
+```sh
+./Scripts/build_mas.sh --refresh-icon-cache
+```
 
 **Note:** a MAS-distribution-signed build **cannot be launched locally** —
 `open` fails with "Launchd job spawn failed" because the distribution profile
@@ -123,11 +154,16 @@ Sources/PhotoImporter/
     VolumeWatcher.swift             NSWorkspace-driven volume list
     PhotoScanner.swift              ImageIO EXIF extraction
     ImportEngine.swift              Plan + execute + verify
+    XXHash64.swift                  Streaming XXH64 (non-cryptographic)
     Deletion.swift                  Post-import unlink
     Eject.swift                     NSWorkspace.unmountAndEjectDevice
     Preflight.swift                 Free-space check
     SequenceStore.swift             Persistent {seq} counter
     PresetStore.swift               Named config persistence
+    CloudKVStore.swift              iCloud KV sync + reachability
+    CardAccessStore.swift           Security-scoped card bookmarks
+    FolderRef.swift                 Bookmark-backed folder reference
+    Sandbox.swift                   Sandbox helpers
   Views/
     AppViewModel.swift              Single owner of UI state
     ContentView.swift               Root layout + section views
@@ -139,8 +175,12 @@ Sources/PhotoImporter/
 Resources/
   Info.plist                        Embedded in binary + copied to bundle
   AppIcon.icns
-Scripts/build_app.sh                Build + bundle into .app
-Tests/PhotoImporterTests/           Parked behind the commented test target
+  PhotoImporter.icon                Icon Composer source (rounded macOS shape)
+  CompiledIcon/                     Pre-compiled Assets.car (no-Xcode builds)
+Scripts/
+  build_app.sh                      Build + bundle into .app (local dev)
+  build_mas.sh                      Signed universal .app + .pkg for the App Store
+Tests/PhotoImporterTests/           swift test (47 tests)
 ```
 
 ## Persistent state

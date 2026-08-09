@@ -179,9 +179,41 @@ struct Preset: Identifiable, Hashable, Codable {
     }
 }
 
+/// Which digest the integrity checks use.
+///
+/// The verify pass re-reads each file from the destination — an internal SSD
+/// at multiple GB/s — so the hash, not the card, is the bottleneck there.
+/// SHA-256 runs ~2,390 MB/s against xxHash64's ~6,410 MB/s on this hardware,
+/// which is real time on a large import.
+///
+/// The trade is collision resistance. xxHash64 is non-cryptographic and only
+/// 64 bits wide, so a deliberate collision is cheap to construct and random
+/// ones are far likelier than with SHA-256's 256 bits. That matters because
+/// `.skippedIdentical` is delete-eligible: under `skipSameHash` with
+/// delete-after-import, a false "identical" verdict deletes a photo that was
+/// never actually copied. Hence SHA-256 stays the default, and the picker
+/// labels this one purely as the faster option.
+enum HashAlgorithm: String, Codable, CaseIterable, Identifiable {
+    case sha256
+    case xxhash64
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .sha256: return "SHA-256 (safer)"
+        case .xxhash64: return "xxHash64 (faster)"
+        }
+    }
+}
+
 struct ImportOptions: Hashable {
     var collisionPolicy: CollisionPolicy
     var verify: Bool
+    /// Digest used for verification and for `skipSameHash` comparisons.
+    /// Defaults to SHA-256 so existing callers and tests keep the safer
+    /// behavior without change.
+    var hashAlgorithm: HashAlgorithm = .sha256
 }
 
 struct ImportItem: Hashable {

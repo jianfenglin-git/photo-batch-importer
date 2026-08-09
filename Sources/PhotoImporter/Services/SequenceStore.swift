@@ -13,6 +13,15 @@ final class SequenceStore: ObservableObject {
     private let key = "sequence.lastSeq"
     private var cancellables: Set<AnyCancellable> = []
 
+    /// True when the counter is not known to be in sync with iCloud, so a
+    /// second Mac could hand out the same `{seq}` numbers. Any of:
+    ///
+    /// - iCloud is unavailable entirely (signed out, iCloud Drive off, or no
+    ///   `ubiquity-kvstore-identifier` entitlement).
+    /// - We're offline, so nothing can reach iCloud right now.
+    /// - We have local writes iCloud hasn't confirmed yet.
+    @Published private(set) var syncUnreliable: Bool = false
+
     init(cloud: CloudKVStore) {
         self.cloud = cloud
         self.lastSeq = UInt64(cloud.int(forKey: key) ?? 0)
@@ -23,6 +32,16 @@ final class SequenceStore: ObservableObject {
                 if newVal > self.lastSeq {
                     self.lastSeq = newVal
                 }
+            }
+            .store(in: &cancellables)
+
+        // Mirror the store's health into one flag the UI can bind to.
+        cloud.$isCloudAvailable
+            .combineLatest(cloud.$hasPendingUnsyncedWrites, cloud.$isOnline)
+            .map { available, pending, online in !available || pending || !online }
+            .removeDuplicates()
+            .sink { [weak self] unreliable in
+                self?.syncUnreliable = unreliable
             }
             .store(in: &cancellables)
     }

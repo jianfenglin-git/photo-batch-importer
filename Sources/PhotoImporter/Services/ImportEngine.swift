@@ -13,6 +13,9 @@ struct CompiledRule {
 /// Each phase reads from the SD card separately so the user can start using
 /// the primary copies while the slower backup copy is in progress.
 enum ImportEngine {
+    /// Read/write granularity for the streaming copy and hash loops.
+    private static let chunkSize = 64 * 1024
+
     /// Build an execution plan: filter every photo against the rule list
     /// top-to-bottom (first match wins; no match = excluded), then sort by
     /// date, detect dual-format pairs, and assign seq numbers. Excluded
@@ -93,20 +96,21 @@ enum ImportEngine {
         options: ImportOptions,
         onProgress: (ImportProgress) -> Void
     ) -> ImportResult? {
-        let backupItems = plan.items.filter { $0.backupDst != nil }
-        guard !backupItems.isEmpty else { return nil }
-        // Rewrite each item so `dst` points at the backup destination for
-        // the shared per-item executor. `backupDst` cleared to keep the
-        // executor single-target.
-        let mapped = backupItems.map { item in
-            ImportItem(
+        // Rewrite each backup-eligible item so `dst` points at the backup
+        // destination for the shared per-item executor; `backupDst` cleared
+        // to keep the executor single-target. One compactMap pass rather
+        // than filter-then-map so only a single array is materialised.
+        let mapped: [ImportItem] = plan.items.compactMap { item in
+            guard let backupDst = item.backupDst else { return nil }
+            return ImportItem(
                 src: item.src,
-                dst: item.backupDst!,
+                dst: backupDst,
                 seq: item.seq,
                 sizeBytes: item.sizeBytes,
                 backupDst: nil
             )
         }
+        guard !mapped.isEmpty else { return nil }
         let totalBytes = mapped.reduce(Int64(0)) { $0 &+ $1.sizeBytes }
         let phasePlan = ImportPlan(items: mapped, totalBytes: totalBytes)
         return executePhase(plan: phasePlan, phase: .backup, options: options, onProgress: onProgress)
@@ -124,7 +128,10 @@ enum ImportEngine {
         let totalItems = plan.items.count
         var bytesDone: Int64 = 0
         for (i, item) in plan.items.enumerated() {
-            let step = executeItem(item, options: options)
+            // Per-item pool as defense in depth: catches autoreleased objects
+            // from path manipulation and FileManager calls, which would
+            // otherwise also accumulate across the whole phase.
+            let step = autoreleasepool { executeItem(item, options: options) }
             switch step.outcome {
             case .copied, .copiedAs:
                 result.copied += 1
@@ -187,10 +194,27 @@ enum ImportEngine {
             let alt = nextAvailable(item.dst)
             return copyAndMaybeVerify(src: item.src, dst: alt, options: options, onSuccess: .copiedAs(alt))
         case .skipSameHash:
-            guard let srcHash = try? hashFile(item.src) else {
+            // Cheap size gate before two full reads. Different lengths can't
+            // be the same file, so this skips ~2x I/O in the common
+            // "different photo, same name" case. When either size is
+            // unreadable, fall through and let the hashes decide.
+            if let srcSize = fileSize(item.src),
+               let dstSize = fileSize(item.dst),
+               srcSize != dstSize {
+                let alt = nextAvailable(item.dst)
+                return copyAndMaybeVerify(src: item.src, dst: alt, options: options, onSuccess: .copiedAs(alt))
+            }
+            // Deliberately SHA-256 regardless of the user's choice. A false
+            // "identical" verdict here is destructive: `.skippedIdentical` is
+            // delete-eligible, so with delete-after-import a 64-bit collision
+            // would erase a photo that was never copied. The speed setting
+            // applies to the verify pass, which only ever compares a file
+            // against bytes we just wrote, and where a mismatch merely
+            // reports a failure.
+            guard let srcHash = try? hashFile(item.src, algorithm: .sha256) else {
                 return Step(outcome: .failed("hash src"), verified: false)
             }
-            guard let dstHash = try? hashFile(item.dst) else {
+            guard let dstHash = try? hashFile(item.dst, algorithm: .sha256) else {
                 return Step(outcome: .failed("hash dst"), verified: false)
             }
             if srcHash == dstHash {
@@ -211,20 +235,31 @@ enum ImportEngine {
     ) -> Step {
         let srcHash: Data
         do {
-            srcHash = try streamingCopyAndHash(src: src, dst: dst)
+            srcHash = try streamingCopyAndHash(
+                src: src, dst: dst, algorithm: options.hashAlgorithm
+            )
         } catch {
             return Step(outcome: .failed("copy: \(error.localizedDescription)"), verified: false)
         }
         if !options.verify {
             return Step(outcome: onSuccess, verified: false)
         }
-        guard let dstHash = try? hashFile(dst) else {
+        guard let dstHash = try? hashFile(dst, algorithm: options.hashAlgorithm) else {
             return Step(outcome: .failed("verify read"), verified: false)
         }
         if dstHash == srcHash {
             return Step(outcome: onSuccess, verified: true)
         }
         return Step(outcome: .verifyFailed, verified: false)
+    }
+
+    /// Byte length of a file, or nil if it can't be read. Callers treat nil
+    /// as "unknown" and fall back to hashing rather than assuming a mismatch.
+    private static func fileSize(_ url: URL) -> UInt64? {
+        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            return nil
+        }
+        return UInt64(size)
     }
 
     /// Generate a sibling path that doesn't exist yet: `foo.jpg` →
@@ -248,10 +283,27 @@ enum ImportEngine {
     /// pass. Returns the hash of the source content that was written;
     /// `hashFile(dst)` run afterwards gives a true end-to-end integrity
     /// check when verify is enabled.
-    private static func streamingCopyAndHash(src: URL, dst: URL) throws -> Data {
+    ///
+    /// Also asserts the byte count matches the source length. That check is
+    /// NOT redundant with the hash: a premature EOF (card pulled mid-copy,
+    /// failing reader) surfaces as a clean end-of-file, so the truncated
+    /// content is what gets hashed *and* written, and the verify comparison
+    /// happily agrees with itself. Only length can catch a short read — and
+    /// it must live here, because with verify off nothing else looks at all.
+    private static func streamingCopyAndHash(
+        src: URL,
+        dst: URL,
+        algorithm: HashAlgorithm
+    ) throws -> Data {
         let fm = FileManager.default
         let reader = try FileHandle(forReadingFrom: src)
         defer { try? reader.close() }
+        // Length of exactly the file we're about to read, from the same
+        // descriptor rather than a separate stat, so nothing can swap the
+        // file out in between. Not `item.sizeBytes` — that was measured at
+        // scan time and may be stale.
+        let expectedBytes = try reader.seekToEnd()
+        try reader.seek(toOffset: 0)
         if !fm.fileExists(atPath: dst.path) {
             guard fm.createFile(atPath: dst.path, contents: nil) else {
                 throw NSError(
@@ -268,26 +320,94 @@ enum ImportEngine {
         // photo produces a corrupt destination whenever Verify is disabled.
         try writer.truncate(atOffset: 0)
 
-        var hasher = SHA256()
+        var sha = SHA256()
+        var xx = XXHash64()
+        var written: UInt64 = 0
         while true {
-            let chunk = try reader.read(upToCount: 64 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-            try writer.write(contentsOf: chunk)
+            // `read(upToCount:)` bridges -[NSFileHandle readDataOfLength:],
+            // whose NSData is autoreleased. The whole phase runs as one
+            // Swift concurrency job with no suspension point, so without an
+            // explicit pool every chunk of every file would be held until
+            // the import finished — one byte of RAM per byte copied.
+            let count: Int = try autoreleasepool {
+                let chunk = try reader.read(upToCount: chunkSize) ?? Data()
+                if chunk.isEmpty { return 0 }
+                switch algorithm {
+                case .sha256: sha.update(data: chunk)
+                case .xxhash64: xx.update(data: chunk)
+                }
+                try writer.write(contentsOf: chunk)
+                return chunk.count
+            }
+            if count == 0 { break }
+            written &+= UInt64(count)
         }
         try writer.synchronize()
-        return Data(hasher.finalize())
+
+        // Short read: we streamed fewer bytes than the source holds. See the
+        // note above — the hash cannot detect this, so fail loudly instead of
+        // reporting a truncated file as a good copy.
+        guard written == expectedBytes else {
+            throw NSError(
+                domain: "PhotoImporter.copy",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "short read: copied \(written) of \(expectedBytes) bytes"]
+            )
+        }
+
+        // Belt and braces: confirm the bytes actually landed on disk at the
+        // expected length, rather than trusting that every write returned
+        // without error. Catches a full disk or a quota cut-off that only
+        // shows up at close time.
+        let landed = (try? fm.attributesOfItem(atPath: dst.path)[.size] as? Int).flatMap { $0 }
+        if let landed, UInt64(landed) != expectedBytes {
+            throw NSError(
+                domain: "PhotoImporter.copy",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "destination is \(landed) bytes, expected \(expectedBytes)"]
+            )
+        }
+        switch algorithm {
+        case .sha256: return Data(sha.finalize())
+        case .xxhash64: return xx.finalizeData()
+        }
     }
 
-    static func hashFile(_ url: URL) throws -> Data {
+    static func hashFile(_ url: URL, algorithm: HashAlgorithm = .sha256) throws -> Data {
         let reader = try FileHandle(forReadingFrom: url)
         defer { try? reader.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try reader.read(upToCount: 64 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
+        switch algorithm {
+        case .sha256:
+            var hasher = SHA256()
+            try streamChunks(reader) { hasher.update(data: $0) }
+            return Data(hasher.finalize())
+        case .xxhash64:
+            var hasher = XXHash64()
+            try streamChunks(reader) { hasher.update(data: $0) }
+            return hasher.finalizeData()
         }
-        return Data(hasher.finalize())
+    }
+
+    /// Feed a file to `sink` in `chunkSize` pieces.
+    ///
+    /// Each iteration runs inside an `autoreleasepool` for the reason spelled
+    /// out in `streamingCopyAndHash`: `read(upToCount:)` returns autoreleased
+    /// NSData and this phase has no suspension point, so without the pool
+    /// memory grows one-for-one with bytes read (GitHub #2).
+    private static func streamChunks(
+        _ reader: FileHandle,
+        _ sink: (Data) -> Void
+    ) throws {
+        while true {
+            let done: Bool = try autoreleasepool {
+                let chunk = try reader.read(upToCount: chunkSize) ?? Data()
+                if chunk.isEmpty { return true }
+                sink(chunk)
+                return false
+            }
+            if done { break }
+        }
     }
 }

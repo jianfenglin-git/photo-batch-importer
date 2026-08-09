@@ -280,6 +280,21 @@ private struct TemplateSection: View {
                 vm.showAllTokens = true
             }
         }
+        // Only shown when the counter is genuinely out of sync AND a template
+        // renders {seq} — otherwise there's no collision to warn about.
+        if vm.showSequenceSyncWarning {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                Text("WARNING: iCloud sync failed, sequence number may collide if you import from multiple devices.")
+                    .font(.system(size: 11))
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.red)
+            .help("The {seq} counter is stored in iCloud so it keeps climbing across your Macs. It couldn't be synced, so another Mac may hand out the same numbers. Set the counter manually to stay clear of numbers already used elsewhere.")
+            .accessibilityLabel("Warning: iCloud sync failed. Sequence numbers may collide if you import from multiple devices.")
+        }
     }
 }
 
@@ -550,8 +565,25 @@ private struct OptionsSection: View {
             .frame(maxWidth: 260)
             Spacer()
         }
-        Toggle("Verify each file after copy", isOn: $vm.verify)
+        HStack(spacing: 6) {
+            Toggle("Verify each file after copy using", isOn: $vm.verify)
+                .controlSize(.small)
+                .fixedSize()
+            Picker("", selection: $vm.hashAlgorithm) {
+                ForEach(HashAlgorithm.allCases) { a in
+                    Text(a.label).tag(a)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
             .controlSize(.small)
+            .fixedSize()
+            // The algorithm only matters when verification runs, so dim it
+            // rather than hide it — hiding would make the row jump height.
+            .disabled(!vm.verify)
+            .help("SHA-256 is cryptographically strong. xxHash64 is roughly 2.7x faster to compute and is a good choice when import speed matters more than absolute certainty. Content-identical collision checks always use SHA-256 regardless of this setting.")
+            Spacer(minLength: 0)
+        }
         Toggle("Permanently delete from card after import (confirms before deleting)", isOn: $vm.deleteAfter)
             .controlSize(.small)
         Toggle("Eject card after import", isOn: $vm.autoEject)

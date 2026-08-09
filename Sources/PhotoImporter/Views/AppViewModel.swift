@@ -63,6 +63,9 @@ final class AppViewModel: ObservableObject {
     // Options
     @Published var collisionPolicy: CollisionPolicy = .skipSameHash
     @Published var verify: Bool = false
+    /// Digest used for the verify pass. SHA-256 by default; xxHash64 trades
+    /// collision resistance for ~2.7x faster hashing. See `HashAlgorithm`.
+    @Published var hashAlgorithm: HashAlgorithm = .sha256
     @Published var deleteAfter: Bool = false
     @Published var autoEject: Bool = false
 
@@ -136,6 +139,35 @@ final class AppViewModel: ObservableObject {
         var verify: Bool
         var deleteAfter: Bool
         var autoEject: Bool
+        var hashAlgorithm: HashAlgorithm
+
+        /// Hand-written so a blob saved by an earlier version — which has no
+        /// `hashAlgorithm` key — still decodes. Synthesized `Codable` throws
+        /// on a missing key even when the property has a default, which would
+        /// make the whole decode fail and silently reset every synced option
+        /// on upgrade.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            collisionPolicy = try c.decode(CollisionPolicy.self, forKey: .collisionPolicy)
+            verify = try c.decode(Bool.self, forKey: .verify)
+            deleteAfter = try c.decode(Bool.self, forKey: .deleteAfter)
+            autoEject = try c.decode(Bool.self, forKey: .autoEject)
+            hashAlgorithm = try c.decodeIfPresent(HashAlgorithm.self, forKey: .hashAlgorithm) ?? .sha256
+        }
+
+        init(
+            collisionPolicy: CollisionPolicy,
+            verify: Bool,
+            deleteAfter: Bool,
+            autoEject: Bool,
+            hashAlgorithm: HashAlgorithm
+        ) {
+            self.collisionPolicy = collisionPolicy
+            self.verify = verify
+            self.deleteAfter = deleteAfter
+            self.autoEject = autoEject
+            self.hashAlgorithm = hashAlgorithm
+        }
     }
 
     private static let localStateKey = "formState.v1"
@@ -232,6 +264,16 @@ final class AppViewModel: ObservableObject {
             .sink { [weak self] _ in self?.recomputeDestinations() }
             .store(in: &cancellables)
 
+        // `sequenceStore` is a plain `let`, so views observing this view model
+        // don't see its @Published changes. Republish the sync-health flag
+        // that `showSequenceSyncWarning` reads, or the warning wouldn't appear
+        // until some unrelated state change happened to redraw the section.
+        sequenceStore.$syncUnreliable
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
         // Live per-row template validation.
         $rules
             .removeDuplicates()
@@ -265,6 +307,7 @@ final class AppViewModel: ObservableObject {
             verify = opts.verify
             deleteAfter = opts.deleteAfter
             autoEject = opts.autoEject
+            hashAlgorithm = opts.hashAlgorithm
         }
 
         // First-run seeding: if the user has no presets (neither local nor
@@ -329,6 +372,11 @@ final class AppViewModel: ObservableObject {
                 guard let self = self, !self.applyingSyncedOptions else { return }
                 self.persistSyncedOptions()
             }.store(in: &cancellables)
+        $hashAlgorithm.dropFirst().receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self = self, !self.applyingSyncedOptions else { return }
+                self.persistSyncedOptions()
+            }.store(in: &cancellables)
 
         // When another Mac pushes an options change via iCloud, adopt it.
         CloudKVStore.shared.externalChanges
@@ -340,6 +388,7 @@ final class AppViewModel: ObservableObject {
                 self.verify = opts.verify
                 self.deleteAfter = opts.deleteAfter
                 self.autoEject = opts.autoEject
+                self.hashAlgorithm = opts.hashAlgorithm
                 self.applyingSyncedOptions = false
             }
             .store(in: &cancellables)
@@ -361,7 +410,8 @@ final class AppViewModel: ObservableObject {
             collisionPolicy: collisionPolicy,
             verify: verify,
             deleteAfter: deleteAfter,
-            autoEject: autoEject
+            autoEject: autoEject,
+            hashAlgorithm: hashAlgorithm
         )
         CloudKVStore.shared.setCodable(opts, forKey: Self.syncedOptionsKey)
     }
@@ -375,6 +425,34 @@ final class AppViewModel: ObservableObject {
 
     /// True when every active rule parses cleanly. Import is blocked when false.
     var rulesValid: Bool { ruleErrors.isEmpty && rules.contains(where: { $0.isActive }) }
+
+    /// True when any active rule actually renders `{seq}`. Used to scope the
+    /// iCloud sync warning: a template that never emits a sequence number
+    /// can't produce a cross-device sequence collision, so warning there
+    /// would just be noise.
+    var usesSequenceToken: Bool {
+        AppViewModel.anyActiveRuleUsesSequence(rules)
+    }
+
+    /// Pure form of `usesSequenceToken`, split out so it's testable without
+    /// constructing a `@MainActor` view model. `nonisolated` because it
+    /// touches no instance state.
+    nonisolated static func anyActiveRuleUsesSequence(_ rules: [TemplateRule]) -> Bool {
+        rules.contains { rule in
+            guard rule.isActive, let segs = try? Template.parse(rule.template) else { return false }
+            return segs.contains { seg in
+                if case .token(.seq) = seg { return true }
+                return false
+            }
+        }
+    }
+
+    /// Show the "iCloud sync failed" warning under the naming template only
+    /// when it's actionable: the counter is out of sync AND a template is
+    /// consuming it.
+    var showSequenceSyncWarning: Bool {
+        sequenceStore.syncUnreliable && usesSequenceToken
+    }
 
     /// User-initiated change to the "next sequence number" value. Unlike
     /// the import-time bump (which flows through Combine to recompute),
@@ -977,7 +1055,11 @@ final class AppViewModel: ObservableObject {
         )
 
         let seqStart = sequenceStore.nextStart()
-        let options = ImportOptions(collisionPolicy: collisionPolicy, verify: verify)
+        let options = ImportOptions(
+            collisionPolicy: collisionPolicy,
+            verify: verify,
+            hashAlgorithm: hashAlgorithm
+        )
         let cardLabel = volume.label
 
         // Hold the card's security scope (if sandboxed) for the whole import
