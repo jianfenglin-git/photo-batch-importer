@@ -57,18 +57,59 @@ elif [[ -f Resources/AppIcon.icns ]]; then
     cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 
-# Ad-hoc code sign with the sandbox / iCloud-KV entitlements. Without a
-# signature the entitlements file is ignored and the app runs unsandboxed —
-# fine for dev, but we want parity with the MAS environment.
+# --- Nest the login-item helper -------------------------------------------
+# Contents/Library/LoginItems/ is the location SMAppService.loginItem requires;
+# it will not find a helper anywhere else in the bundle.
+HELPER_BIN="$(swift build $SWIFT_CONFIG_FLAG --show-bin-path)/PhotoImporterHelper"
+HELPER_APP="$APP_DIR/Contents/Library/LoginItems/PhotoImporterHelper.app"
+if [[ -f "$HELPER_BIN" ]]; then
+    echo "› embedding login item"
+    mkdir -p "$HELPER_APP/Contents/MacOS"
+    cp "$HELPER_BIN" "$HELPER_APP/Contents/MacOS/PhotoImporterHelper"
+    chmod +x "$HELPER_APP/Contents/MacOS/PhotoImporterHelper"
+    cp Resources/HelperInfo.plist "$HELPER_APP/Contents/Info.plist"
+fi
+
+# --- Sign ------------------------------------------------------------------
+# Without a signature the entitlements file is ignored and the app runs with
+# whatever the OS defaults to — fine for dev, but we want parity with MAS.
+#
+# The identity matters more than it used to: SMAppService refuses to register a
+# login item whose signature doesn't carry the same Team ID as the app doing
+# the registering, and an ad-hoc (`-`) signature carries no team at all. So an
+# ad-hoc dev build silently can't test the auto-open toggle. Prefer a real
+# Development identity and say plainly when falling back.
 ENTITLEMENTS="Resources/PhotoImporter.entitlements"
+HELPER_ENTITLEMENTS="Resources/PhotoImporterHelper.entitlements"
+
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"' || true)"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="-"
+    echo "› no 'Apple Development' identity found — signing ad-hoc"
+    echo "  (everything works except the auto-open login item, which needs a team)"
+else
+    echo "› codesign identity: $SIGN_IDENTITY"
+fi
+
+xattr -cr "$APP_DIR"
+
+# Inside-out: a nested bundle must be signed before the bundle that contains
+# it, or the outer signature seals a helper that is about to change.
+if [[ -d "$HELPER_APP" ]]; then
+    codesign --force --sign "$SIGN_IDENTITY" \
+        --entitlements "$HELPER_ENTITLEMENTS" \
+        --options runtime \
+        "$HELPER_APP" || echo "  (helper codesign failed — auto-open won't register)"
+fi
+
 if [[ -f "$ENTITLEMENTS" ]]; then
-    echo "› codesign --entitlements $ENTITLEMENTS"
-    codesign --force --sign - \
+    codesign --force --sign "$SIGN_IDENTITY" \
         --entitlements "$ENTITLEMENTS" \
         --options runtime \
-        "$APP_DIR" 2>/dev/null || {
-        echo "  (codesign failed — app will run but entitlements won't be active)"
-    }
+        "$APP_DIR" || echo "  (codesign failed — app runs but entitlements aren't active)"
 fi
 
 echo "› done: $REPO_ROOT/$APP_DIR"

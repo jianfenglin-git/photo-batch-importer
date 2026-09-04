@@ -23,6 +23,21 @@ let package = Package(
                 ])
             ]
         ),
+        // Background login item, nested inside the main app bundle at
+        // Contents/Library/LoginItems/. Opens the main app when a card is
+        // mounted — the only sandbox-legal way to get launch-on-insert.
+        .executableTarget(
+            name: "PhotoImporterHelper",
+            path: "Sources/PhotoImporterHelper",
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Resources/HelperInfo.plist",
+                ])
+            ]
+        ),
         .testTarget(
             name: "PhotoImporterTests",
             dependencies: ["PhotoImporter"],

@@ -8,6 +8,9 @@
 #   - "3rd Party Mac Developer Installer: … (TEAMID)" identity   (signs .pkg)
 #   - Apple WWDR G3 intermediate cert installed                  (chain)
 #   - A Mac App Store provisioning profile for the app's bundle id
+#   - A SECOND Mac App Store provisioning profile for the nested login item
+#     (App ID com.jianfenglin.photoimporter.LoginItemHelper). Build without the
+#     login item with HELPER=0 if you don't have it yet.
 #
 # Full Xcode is NOT required. Without it:
 #   - the pre-compiled icon in Resources/CompiledIcon is used, after verifying
@@ -23,6 +26,8 @@
 #   APP_IDENTITY="Apple Distribution: Jianfeng Lin (MA5JSLK6AZ)"
 #   PKG_IDENTITY="3rd Party Mac Developer Installer: Jianfeng Lin (MA5JSLK6AZ)"
 #   PROFILE="certs/Photo_Importer.provisionprofile"
+#   HELPER_PROFILE="certs/Photo_Importer_Helper.provisionprofile"
+#   HELPER=0               omit the login item (auto-open toggle hides itself)
 #   REFRESH_ICON_CACHE=1   same as --refresh-icon-cache
 #
 # Output:
@@ -46,6 +51,9 @@ APP_DIR="build/${APP_NAME}.app"
 PKG_PATH="build/${APP_NAME}.pkg"
 ENTITLEMENTS="Resources/PhotoImporter.mas.entitlements"
 PROFILE="${PROFILE:-certs/Photo_Importer.provisionprofile}"
+HELPER_ENTITLEMENTS="Resources/PhotoImporterHelper.mas.entitlements"
+HELPER_PROFILE="${HELPER_PROFILE:-certs/Photo_Importer_Helper.provisionprofile}"
+HELPER_APP="$APP_DIR/Contents/Library/LoginItems/PhotoImporterHelper.app"
 ICON_NAME="PhotoImporter"   # → Resources/PhotoImporter.icon (Icon Composer bundle)
 
 # --- Resolve signing identities -------------------------------------------
@@ -87,9 +95,34 @@ if [[ ! -f "$PROFILE" ]]; then
     exit 1
 fi
 
+# The nested login item is a separate .app with its own bundle id, so the App
+# Store wants its own App ID and its own profile — the app's profile does not
+# cover it, and uploading without one fails at validation rather than at build
+# time, which is a much worse place to find out.
+if [[ "${HELPER:-1}" == "1" && ! -f "$HELPER_PROFILE" ]]; then
+    echo "error: login-item provisioning profile not found at: $HELPER_PROFILE" >&2
+    echo >&2
+    echo "The nested login item needs its own App ID + Mac App Store profile:" >&2
+    echo "  1. https://developer.apple.com/account/resources/identifiers" >&2
+    echo "     → new App ID, bundle id com.jianfenglin.photoimporter.LoginItemHelper" >&2
+    echo "  2. https://developer.apple.com/account/resources/profiles" >&2
+    echo "     → new Mac App Store profile for that App ID, using the same" >&2
+    echo "       Apple Distribution certificate as the app's profile" >&2
+    echo "  3. save it as $HELPER_PROFILE" >&2
+    echo >&2
+    echo "To build without the auto-open feature in the meantime:" >&2
+    echo "    HELPER=0 Scripts/build_mas.sh" >&2
+    exit 1
+fi
+
 echo "› app identity: $APP_IDENTITY"
 echo "› pkg identity: $PKG_IDENTITY"
 echo "› profile:      $PROFILE"
+if [[ "${HELPER:-1}" == "1" ]]; then
+    echo "› helper profile: $HELPER_PROFILE"
+else
+    echo "› login item: SKIPPED (HELPER=0)"
+fi
 
 # --- Build a release binary ------------------------------------------------
 # Universal (arm64 + x86_64) without full Xcode: `swift build --arch a --arch b`
@@ -103,40 +136,57 @@ echo "› profile:      $PROFILE"
 MIN_OS_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Resources/Info.plist)"
 HOST_ARCH="$(uname -m)"
 
+# Both products (app + login item) come out of the same build invocations, so
+# each branch below just records the bin directories and the two executables
+# are picked out of them afterwards.
 if [[ "${UNIVERSAL:-1}" != "1" ]]; then
     echo "› swift build -c release [native ($HOST_ARCH)]"
     swift build -c release
-    BIN_PATH="$(swift build -c release --show-bin-path)/PhotoImporter"
+    BIN_DIRS=("$(swift build -c release --show-bin-path)")
 elif [[ -x "/Library/Developer/SharedFrameworks/XCBuild.framework/Versions/A/Support/xcbuild" ]]; then
     # Full Xcode present: let SwiftPM build both slices in one invocation.
     echo "› swift build -c release [universal (arm64 + x86_64), via xcbuild]"
     swift build -c release --arch arm64 --arch x86_64
-    BIN_PATH="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/PhotoImporter"
+    BIN_DIRS=("$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)")
 else
     echo "› swift build -c release [universal (arm64 + x86_64), per-arch + lipo]"
-    SLICES=()
+    BIN_DIRS=()
     for arch in arm64 x86_64; do
         triple="${arch}-apple-macosx${MIN_OS_BUILD}"
         echo "  › $triple"
         swift build -c release --triple "$triple"
-        slice="$(swift build -c release --triple "$triple" --show-bin-path)/PhotoImporter"
-        if [[ ! -f "$slice" ]]; then
-            echo "error: $arch slice not found at $slice" >&2
-            exit 1
-        fi
-        SLICES+=("$slice")
+        BIN_DIRS+=("$(swift build -c release --triple "$triple" --show-bin-path)")
     done
-    BIN_PATH="build/PhotoImporter-universal"
-    mkdir -p build
-    rm -f "$BIN_PATH"
-    lipo -create -output "$BIN_PATH" "${SLICES[@]}"
 fi
 
-if [[ ! -f "$BIN_PATH" ]]; then
-    echo "error: executable not found at $BIN_PATH" >&2
-    exit 1
-fi
+# One bin dir → the executable is already final (native, or fat from xcbuild).
+# Several → one slice per dir, merged with lipo into build/<product>-universal.
+mkdir -p build
+resolve_product() {
+    local product="$1" slices=() dir out
+    for dir in "${BIN_DIRS[@]}"; do
+        if [[ ! -f "$dir/$product" ]]; then
+            echo "error: $product not found at $dir/$product" >&2
+            exit 1
+        fi
+        slices+=("$dir/$product")
+    done
+    if [[ "${#slices[@]}" -eq 1 ]]; then
+        printf '%s' "${slices[0]}"
+        return
+    fi
+    out="build/${product}-universal"
+    rm -f "$out"
+    lipo -create -output "$out" "${slices[@]}"
+    printf '%s' "$out"
+}
+
+BIN_PATH="$(resolve_product PhotoImporter)"
 echo "› binary archs: $(lipo -archs "$BIN_PATH")"
+if [[ "${HELPER:-1}" == "1" ]]; then
+    HELPER_BIN="$(resolve_product PhotoImporterHelper)"
+    echo "› helper archs: $(lipo -archs "$HELPER_BIN")"
+fi
 
 # --- Assemble the .app bundle ---------------------------------------------
 echo "› assembling $APP_DIR"
@@ -228,6 +278,33 @@ else
     exit 1
 fi
 
+# --- Nest the login-item helper -------------------------------------------
+# Contents/Library/LoginItems/ is the only place SMAppService.loginItem looks.
+# The helper is a full .app with its own bundle id, so the App Store treats it
+# as a separate submission unit: its own provisioning profile, its own
+# entitlements, its own signature.
+if [[ "${HELPER:-1}" == "1" ]]; then
+    echo "› embedding login item"
+    mkdir -p "$HELPER_APP/Contents/MacOS"
+    cp "$HELPER_BIN" "$HELPER_APP/Contents/MacOS/PhotoImporterHelper"
+    chmod +x "$HELPER_APP/Contents/MacOS/PhotoImporterHelper"
+    cp Resources/HelperInfo.plist "$HELPER_APP/Contents/Info.plist"
+    cat "$HELPER_PROFILE" > "$HELPER_APP/Contents/embedded.provisionprofile"
+
+    # A version skew between the app and a nested bundle is an App Store
+    # rejection, and it is the easiest thing in the world to forget when
+    # bumping one plist and not the other.
+    for key in CFBundleShortVersionString CFBundleVersion; do
+        app_v="$(/usr/libexec/PlistBuddy -c "Print :$key" Resources/Info.plist)"
+        helper_v="$(/usr/libexec/PlistBuddy -c "Print :$key" Resources/HelperInfo.plist)"
+        if [[ "$app_v" != "$helper_v" ]]; then
+            echo "error: $key differs — app $app_v, helper $helper_v." >&2
+            echo "       Bump Resources/HelperInfo.plist to match Resources/Info.plist." >&2
+            exit 1
+        fi
+    done
+fi
+
 # The Mac App Store requires the provisioning profile embedded in the bundle
 # BEFORE signing, at this exact path. Copy via `cat` (stream the bytes) rather
 # than `cp`: cp clones the source's extended attributes, and a browser-
@@ -247,6 +324,16 @@ xattr -cr "$APP_DIR"
 # --- Sign the app ----------------------------------------------------------
 # No --options runtime: hardened runtime is a Developer-ID/notarization
 # concern, not a Mac App Store one. --timestamp is required for submission.
+# Inside-out: a nested bundle must be signed before the bundle containing it,
+# or the outer signature seals a helper that is about to change underneath it.
+if [[ "${HELPER:-1}" == "1" ]]; then
+    echo "› codesign login item"
+    codesign --force --sign "$APP_IDENTITY" \
+        --entitlements "$HELPER_ENTITLEMENTS" \
+        --timestamp \
+        "$HELPER_APP"
+fi
+
 echo "› codesign app"
 codesign --force --sign "$APP_IDENTITY" \
     --entitlements "$ENTITLEMENTS" \
@@ -318,7 +405,7 @@ awk -v id="$BUNDLE_ID" -v ver="$SHORT_VER" \
 productbuild --distribution "$DIST" --package-path build \
     --sign "$PKG_IDENTITY" \
     "$PKG_PATH"
-rm -rf "$STAGE" "$COMPONENT_PKG" build/PhotoImporter-universal
+rm -rf "$STAGE" "$COMPONENT_PKG" build/PhotoImporter-universal build/PhotoImporterHelper-universal
 
 echo
 echo "› done."

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Dev entitlements for the login-item helper.
+
+         Unlike the main app's dev entitlements (which switch the sandbox OFF
+         so local builds can read cards without the Powerbox grant), the helper
+         is sandboxed even in dev. It has to be: the whole question this helper
+         answers is what a *sandboxed* background agent is allowed to observe
+         and launch, and an unsandboxed dev helper would answer it wrongly.
+
+         Sandbox only — no file access of any kind. The helper reads volume
+         resource values off mount notifications and calls NSWorkspace to open
+         the app; if either of those needed an entitlement, this build would
+         fail loudly rather than quietly work for the wrong reason. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+</dict>
+</plist>

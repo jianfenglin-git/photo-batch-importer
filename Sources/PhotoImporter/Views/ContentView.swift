@@ -548,6 +548,7 @@ struct ChipButtonStyle: ButtonStyle {
 
 private struct OptionsSection: View {
     @EnvironmentObject private var vm: AppViewModel
+    @StateObject private var loginItem = LoginItemController()
 
     var body: some View {
         SectionHeader { Text("Options").sectionStyle() }
@@ -588,6 +589,47 @@ private struct OptionsSection: View {
             .controlSize(.small)
         Toggle("Eject card after import", isOn: $vm.autoEject)
             .controlSize(.small)
+
+        if loginItem.isAvailable {
+            Toggle("Open this app automatically when a card is inserted", isOn: Binding(
+                get: { loginItem.isEnabled },
+                set: { loginItem.setEnabled($0) }
+            ))
+            .controlSize(.small)
+            .help("Installs a small background item that watches for card insertions and opens Photo Batch Importer. It runs at login, has no window, and does nothing else. Remove it any time with this switch, or in System Settings ▸ General ▸ Login Items.")
+            // The switch can also be flipped in System Settings, so re-read
+            // the real state whenever the user comes back to this window.
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSApplication.didBecomeActiveNotification
+            )) { _ in loginItem.refresh() }
+
+            if loginItem.needsApproval {
+                loginItemNote("Waiting for approval in System Settings ▸ General ▸ Login Items.") {
+                    Button("Open Login Items") { loginItem.openLoginItemsSettings() }
+                        .controlSize(.small)
+                }
+            } else if let error = loginItem.lastError {
+                loginItemNote("Couldn't change the setting: \(error)")
+            }
+        }
+    }
+
+    /// Small indented note under the auto-open toggle, with an optional
+    /// trailing control.
+    @ViewBuilder
+    private func loginItemNote<Trailing: View>(
+        _ message: String,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() }
+    ) -> some View {
+        HStack(spacing: 8) {
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            trailing()
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 18)
     }
 }
 
