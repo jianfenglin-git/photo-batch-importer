@@ -6,7 +6,7 @@
 #   Scripts/build_app.sh --debug         # debug build (faster, for iteration)
 #
 # Output:
-#   build/Photo Importer.app
+#   build/Photo Importer.app      (override with APP_DIR=…)
 
 set -euo pipefail
 
@@ -20,6 +20,10 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Force a relink so the -sectcreate'd Info.plist is current (see build_mas.sh).
+find .build -type f \( -name PhotoImporter -o -name PhotoImporterHelper \) \
+    -path "*/$CONFIG/*" -delete 2>/dev/null || true
+
 echo "› swift build $SWIFT_CONFIG_FLAG"
 swift build $SWIFT_CONFIG_FLAG
 
@@ -29,7 +33,7 @@ if [[ ! -f "$BIN_PATH" ]]; then
     exit 1
 fi
 
-APP_DIR="build/Photo Batch Importer.app"
+APP_DIR="${APP_DIR:-build/Photo Batch Importer.app}"
 echo "› assembling $APP_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"

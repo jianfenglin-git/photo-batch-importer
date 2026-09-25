@@ -139,6 +139,13 @@ HOST_ARCH="$(uname -m)"
 # Both products (app + login item) come out of the same build invocations, so
 # each branch below just records the bin directories and the two executables
 # are picked out of them afterwards.
+# Force a relink of both executables. Each embeds its Info.plist via
+# `-sectcreate __TEXT __info_plist`, but SwiftPM doesn't track that plist as an
+# input: bump only the version and an untouched target (the helper) keeps its
+# old slice, and Transporter rejects the mismatch with error 90336.
+find .build -type f \( -name PhotoImporter -o -name PhotoImporterHelper \) \
+    -path '*/release/*' -delete 2>/dev/null || true
+
 if [[ "${UNIVERSAL:-1}" != "1" ]]; then
     echo "› swift build -c release [native ($HOST_ARCH)]"
     swift build -c release
@@ -187,6 +194,30 @@ if [[ "${HELPER:-1}" == "1" ]]; then
     HELPER_BIN="$(resolve_product PhotoImporterHelper)"
     echo "› helper archs: $(lipo -archs "$HELPER_BIN")"
 fi
+
+# Belt and braces for the relink above: every slice's embedded Info.plist must
+# carry the same version as the plist that goes into the bundle (error 90336).
+check_embedded_plist() {
+    local bin="$1" plist="$2" arch tmp key want got
+    tmp="$(mktemp -d)"
+    for arch in $(lipo -archs "$bin"); do
+        lipo -thin "$arch" "$bin" -output "$tmp/slice" 2>/dev/null || cp "$bin" "$tmp/slice"
+        segedit "$tmp/slice" -extract __TEXT __info_plist "$tmp/embedded.plist" >/dev/null
+        for key in CFBundleShortVersionString CFBundleVersion; do
+            want="$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")"
+            got="$(/usr/libexec/PlistBuddy -c "Print :$key" "$tmp/embedded.plist")"
+            if [[ "$want" != "$got" ]]; then
+                echo "error: $(basename "$bin") [$arch] embeds $key $got, $plist says $want." >&2
+                rm -rf "$tmp"
+                exit 1
+            fi
+        done
+    done
+    rm -rf "$tmp"
+}
+check_embedded_plist "$BIN_PATH" Resources/Info.plist
+[[ -n "${HELPER_BIN:-}" ]] && check_embedded_plist "$HELPER_BIN" Resources/HelperInfo.plist
+echo "› embedded Info.plists match"
 
 # --- Assemble the .app bundle ---------------------------------------------
 echo "› assembling $APP_DIR"

@@ -279,6 +279,21 @@ struct ImportResult {
 struct TwoPhaseResult {
     var primary: ImportResult
     var backup: ImportResult?
+
+    /// At least one file landed in the primary folder and nothing failed
+    /// (copy or verify) in either phase.
+    var isFullySuccessful: Bool {
+        let phases = [primary] + (backup.map { [$0] } ?? [])
+        return primary.copied + primary.overwritten > 0
+            && phases.allSatisfy { $0.failed == 0 && $0.verifyFailed == 0 }
+    }
+}
+
+/// External pages the app links to (support sheet + Help menu).
+enum SupportLinks {
+    static let appStoreReview = URL(string: "https://apps.apple.com/us/app/photo-batch-importer/id6776498495?action=write-review")!
+    static let donate = URL(string: "https://www.paypal.com/paypalme/JianfengLin8")!
+    static let support = URL(string: "https://jianfenglin-git.github.io/photo-batch-importer/support.html")!
 }
 
 struct Preflight: Hashable {

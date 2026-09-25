@@ -88,6 +88,7 @@ struct ContentView: View {
             if vm.presetSaveSheet != nil { PresetSaveSheet() }
         }
         .sheet(isPresented: $vm.showAllTokens) { AllTokensSheet() }
+        .sheet(isPresented: $vm.showSupportPrompt) { SupportPromptSheet() }
     }
 }
 

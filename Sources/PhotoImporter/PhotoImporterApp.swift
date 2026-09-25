@@ -26,7 +26,31 @@ struct PhotoImporterApp: App {
         .defaultSize(width: 750, height: 1000)
         .commands {
             CommandGroup(replacing: .newItem) { }
+            CommandGroup(replacing: .appInfo) { AboutMenuItem() }
+            CommandGroup(replacing: .help) {
+                Button("Photo Batch Importer Help") {
+                    NSWorkspace.shared.open(SupportLinks.support)
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
         }
+
+        Window("About Photo Batch Importer", id: AboutMenuItem.windowID) {
+            AboutView()
+        }
+        .windowResizability(.contentSize)
+        .commandsRemoved()   // keep it out of the Window menu
+    }
+}
+
+/// App menu → "About Photo Batch Importer". A View (not a bare Button) so it
+/// can read `openWindow` from the environment.
+struct AboutMenuItem: View {
+    static let windowID = "about"
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("About Photo Batch Importer") { openWindow(id: Self.windowID) }
     }
 }
 

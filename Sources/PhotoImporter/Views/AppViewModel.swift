@@ -90,6 +90,9 @@ final class AppViewModel: ObservableObject {
     @Published var presetSaveSheet: PresetSaveSheetState?
     @Published var presetDeleteConfirm: Preset?
     @Published var showAllTokens: Bool = false
+    /// One-time "rate / donate / contact" sheet shown after the first
+    /// fully successful import. See `maybeShowSupportPrompt()`.
+    @Published var showSupportPrompt: Bool = false
 
     // Eject feedback
     @Published var ejectingMounts: Set<String> = []
@@ -172,6 +175,8 @@ final class AppViewModel: ObservableObject {
 
     private static let localStateKey = "formState.v1"
     private static let syncedOptionsKey = "options.v1"
+    /// Device-local (UserDefaults, not iCloud) so each Mac asks at most once.
+    private static let supportPromptShownKey = "supportPromptShown.v1"
 
     /// Two starter presets seeded on first launch when the user has no
     /// presets yet. The first is the default selection.
@@ -1165,6 +1170,7 @@ final class AppViewModel: ObservableObject {
                 self.currentPhase = nil
                 self.phaseMessage = "All done."
                 self.eligibleSources = localEligible
+                self.supportPromptDue = self.importResult?.isFullySuccessful == true
                 if let opts = self.runOptions {
                     if opts.deleteAfter && !localEligible.isEmpty {
                         self.deleteConfirm = DeleteConfirmState(
@@ -1176,7 +1182,31 @@ final class AppViewModel: ObservableObject {
                         self.doEject(mountPoint: opts.volumeMount)
                     }
                 }
+                // With delete-after on, the delete-confirm sheet is up; the
+                // prompt waits until the user answers it (confirm/cancelDelete).
+                if self.deleteConfirm == nil {
+                    self.maybeShowSupportPrompt()
+                }
             }
+        }
+    }
+
+    // MARK: - Support prompt
+
+    /// Set when the latest import finished with no failures; consumed by
+    /// `maybeShowSupportPrompt()` once no other sheet is in the way.
+    private var supportPromptDue = false
+
+    private func maybeShowSupportPrompt() {
+        guard supportPromptDue else { return }
+        supportPromptDue = false
+        let defaults = UserDefaults.standard
+        guard !defaults.bool(forKey: Self.supportPromptShownKey) else { return }
+        defaults.set(true, forKey: Self.supportPromptShownKey)
+        // Short delay so a just-dismissed sheet (delete confirm) finishes
+        // animating out before this one is presented.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.showSupportPrompt = true
         }
     }
 
@@ -1187,6 +1217,7 @@ final class AppViewModel: ObservableObject {
         let paths = state.paths
         let mount = state.volumeMount
         deleteConfirm = nil
+        maybeShowSupportPrompt()
         // Hold the card's security scope (if sandboxed) so deleting source
         // files off the card succeeds. nil in dev builds.
         let cardAccess = cardAccessStore.resolve(forMountPath: mount.path)
@@ -1205,6 +1236,7 @@ final class AppViewModel: ObservableObject {
     func cancelDelete() {
         let mount = deleteConfirm?.volumeMount
         deleteConfirm = nil
+        maybeShowSupportPrompt()
         if let mount = mount, runOptions?.autoEject == true {
             doEject(mountPoint: mount)
         }

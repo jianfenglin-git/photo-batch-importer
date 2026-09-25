@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct DeleteConfirmSheet: View {
     @EnvironmentObject private var vm: AppViewModel
@@ -152,6 +153,81 @@ struct AllTokensSheet: View {
         }
         .padding(20)
         .frame(width: 500)
+    }
+}
+
+struct SupportPromptSheet: View {
+    @EnvironmentObject private var vm: AppViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Your first import is done!")
+                .font(.headline)
+            Text("Thanks for using Photo Batch Importer. If it's working well for you, a rating on the App Store helps other photographers find it.")
+            Text("It's built and maintained by one developer. If you find it useful, you can buy me a coffee or help cover the yearly Apple Developer fee through PayPal.")
+            Text(supportLine)
+            Text("To reduce interruption, this dialog only shows once after the first import, but you can find the same information in the About dialog from the menu bar.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            HStack {
+                SupportLinkButtons()
+                Spacer()
+                // Opening a link leaves the sheet up; only Close dismisses it.
+                Button("Close") { vm.showSupportPrompt = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+    }
+
+    /// The link is attached as a real URL attribute. Interpolating the URL
+    /// into a markdown `LocalizedStringKey` doesn't work — the interpolation
+    /// becomes a format argument, the link target is garbage, and clicking it
+    /// fails with LaunchServices error -50.
+    private var supportLine: AttributedString {
+        var link = AttributedString("support page")
+        link.link = SupportLinks.support
+        return AttributedString("Questions or ideas for new features? Get in touch through the ")
+            + link + AttributedString(".")
+    }
+}
+
+/// "Rate" + "Donate" pair shared by the support sheet and the About window.
+struct SupportLinkButtons: View {
+    var body: some View {
+        Button("Rate on the App Store") { NSWorkspace.shared.open(SupportLinks.appStoreReview) }
+        Button("Donate with PayPal") { NSWorkspace.shared.open(SupportLinks.donate) }
+    }
+}
+
+/// Replaces the standard About panel so it can carry the rate/donate buttons.
+struct AboutView: View {
+    private let info = Bundle.main.infoDictionary ?? [:]
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable()
+                .frame(width: 96, height: 96)
+            Text(info["CFBundleDisplayName"] as? String ?? "Photo Batch Importer")
+                .font(.system(size: 16, weight: .bold))
+            Text("Version \(info["CFBundleShortVersionString"] as? String ?? "?") (\(info["CFBundleVersion"] as? String ?? "?"))")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            Text("If you find the app useful, a rating or a coffee is much appreciated.")
+                .font(.system(size: 12))
+                .multilineTextAlignment(.center)
+                // Report the wrapped height; otherwise the content-sized
+                // window is measured for one line and clips the rest.
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 6)
+            HStack { SupportLinkButtons() }
+            Button("Questions & Feature Requests") { NSWorkspace.shared.open(SupportLinks.support) }
+        }
+        .padding(24)
+        .frame(width: 380)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
