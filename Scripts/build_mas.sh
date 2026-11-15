@@ -39,6 +39,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# The Command Line Tools for macOS 27 ship without SwiftUI's macro plugin, so
+# `@State` fails to expand ("plugin for module 'SwiftUIMacros' not found").
+# Build with full Xcode's toolchain when it's installed and the caller hasn't
+# picked one.
+if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
 for arg in "$@"; do
     case "$arg" in
         --refresh-icon-cache) REFRESH_ICON_CACHE=1 ;;
@@ -406,7 +414,11 @@ mkdir -p "$STAGE"
 # (a) Non-relocatable component pkg. ditto preserves the code signature.
 ditto "$APP_DIR" "$STAGE/${APP_NAME}.app"
 pkgbuild --analyze --root "$STAGE" "$COMPONENT_PLIST"
-/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$COMPONENT_PLIST"
+# Force non-relocatable. Older pkgbuild writes `BundleIsRelocatable = true`;
+# the macOS 27 one leaves the key out entirely, so `Set` alone fails. Delete
+# whatever is there and add it back as false either way.
+/usr/libexec/PlistBuddy -c "Delete :0:BundleIsRelocatable" "$COMPONENT_PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$COMPONENT_PLIST"
 pkgbuild --root "$STAGE" \
     --component-plist "$COMPONENT_PLIST" \
     --identifier "$BUNDLE_ID" \

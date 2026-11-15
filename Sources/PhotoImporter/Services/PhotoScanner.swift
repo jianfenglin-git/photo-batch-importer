@@ -20,57 +20,126 @@ enum PhotoScanner {
         guard let enumerator else { return [] }
 
         var results: [PhotoFile] = []
+        var sidecars: [(url: URL, size: Int64)] = []
         for case let url as URL in enumerator {
             let ext = url.pathExtension.lowercased()
-            guard FileType.allKnownExtensions.contains(ext) else { continue }
+            let isSidecar = FileType.sidecarExtensions.contains(ext)
+            guard isSidecar || FileType.allKnownExtensions.contains(ext) else { continue }
             let values = try? url.resourceValues(forKeys: Set(keys))
             guard values?.isRegularFile ?? false else { continue }
             let size = Int64(values?.fileSize ?? 0)
+            if isSidecar {
+                sidecars.append((url, size))
+                continue
+            }
             let meta = extractMeta(from: url)
             results.append(PhotoFile(path: url, sizeBytes: size, meta: meta))
         }
+        attachSidecars(sidecars, to: &results)
         return results
+    }
+
+    /// Hang each sidecar (`.AAE`) on the photo or video with the same folder
+    /// and base name — or, for iOS's second edit record `IMG_O1234.AAE`, the
+    /// name without the `O` — preferring a JPEG/HEIC over a RAW over a video
+    /// when a stem has several. A sidecar with no matching file is dropped:
+    /// on its own it describes nothing.
+    static func attachSidecars(_ sidecars: [(url: URL, size: Int64)], to photos: inout [PhotoFile]) {
+        guard !sidecars.isEmpty else { return }
+        func key(_ url: URL) -> String {
+            url.deletingLastPathComponent().path + "\u{1F}"
+                + url.deletingPathExtension().lastPathComponent.lowercased()
+        }
+        func rank(_ p: PhotoFile) -> Int {
+            let ext = p.path.pathExtension.lowercased()
+            if FileType.jpgExtensions.contains(ext) { return 0 }
+            if FileType.rawExtensions.contains(ext) { return 1 }
+            return 2
+        }
+        var owner: [String: Int] = [:]
+        for (i, p) in photos.enumerated() {
+            let k = key(p.path)
+            if let current = owner[k], rank(photos[current]) <= rank(p) { continue }
+            owner[k] = i
+        }
+        var touched: Set<Int> = []
+        for sidecar in sidecars {
+            let stem = sidecar.url.deletingPathExtension().lastPathComponent
+            var match = owner[key(sidecar.url)]
+            if match == nil, let r = stem.range(of: "_O", options: [.caseInsensitive]),
+               r.upperBound < stem.endIndex {
+                // IMG_O5539 → IMG_5539
+                let plain = stem.replacingCharacters(in: r, with: "_")
+                let candidate = sidecar.url.deletingLastPathComponent()
+                    .appendingPathComponent(plain).appendingPathExtension(sidecar.url.pathExtension)
+                match = owner[key(candidate)]
+            }
+            guard let i = match else { continue }
+            photos[i].companions.append(CompanionFile(
+                path: sidecar.url,
+                sizeBytes: sidecar.size,
+                suffix: CompanionFile.sidecarSuffix(
+                    photoStem: photos[i].path.deletingPathExtension().lastPathComponent,
+                    sidecarStem: stem
+                )
+            ))
+            touched.insert(i)
+        }
+        for i in touched {
+            photos[i].companions = CompanionFile.uniquified(photos[i].companions)
+        }
     }
 
     static func extractMeta(from url: URL) -> PhotoMeta {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
         else {
             return mtimeFallback(url: url)
         }
-        let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any]
-        let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
-        let make = tiff?[kCGImagePropertyTIFFMake] as? String
-        let model = tiff?[kCGImagePropertyTIFFModel] as? String
-        let lens = (exif?[kCGImagePropertyExifLensModel] as? String)
-            ?? (exif?["LensModel" as CFString] as? String)
-        let serial = (exif?[kCGImagePropertyExifBodySerialNumber] as? String)
-            ?? (exif?["BodySerialNumber" as CFString] as? String)
-        let owner = (exif?[kCGImagePropertyExifCameraOwnerName] as? String)
-            ?? (exif?["CameraOwnerName" as CFString] as? String)
-        let subsec = (exif?[kCGImagePropertyExifSubsecTimeOriginal] as? String)
-            ?? (exif?["SubsecTimeOriginal" as CFString] as? String)
+        return meta(fromProperties: props, fallbackDate: fileMtime(url: url))
+    }
+
+    /// Build `PhotoMeta` from an ImageIO-style properties dictionary
+    /// (`{Exif}`, `{TIFF}`, … sub-dictionaries). Shared by the card scanner,
+    /// which gets it from `CGImageSource`, and connected devices, where
+    /// ImageCaptureCore returns the same shape from the camera's metadata.
+    ///
+    /// `fallbackDate` stands in when the dictionary carries no capture date
+    /// (file mtime for a card, the device's own capture date for a device).
+    static func meta(fromProperties props: [String: Any], fallbackDate: @autoclosure () -> Date?) -> PhotoMeta {
+        let exif = props[kCGImagePropertyExifDictionary as String] as? [String: Any]
+        let tiff = props[kCGImagePropertyTIFFDictionary as String] as? [String: Any]
+        func exifValue(_ key: CFString, _ fallbackKey: String) -> Any? {
+            exif?[key as String] ?? exif?[fallbackKey]
+        }
+        let make = tiff?[kCGImagePropertyTIFFMake as String] as? String
+        let model = tiff?[kCGImagePropertyTIFFModel as String] as? String
+        let lens = exifValue(kCGImagePropertyExifLensModel, "LensModel") as? String
+        let serial = exifValue(kCGImagePropertyExifBodySerialNumber, "BodySerialNumber") as? String
+        let owner = exifValue(kCGImagePropertyExifCameraOwnerName, "CameraOwnerName") as? String
+        let subsec = exifValue(kCGImagePropertyExifSubsecTimeOriginal, "SubsecTimeOriginal") as? String
         let iso: Int? = {
-            if let arr = exif?[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber], let first = arr.first {
+            let raw = exif?[kCGImagePropertyExifISOSpeedRatings as String]
+            if let arr = raw as? [NSNumber], let first = arr.first {
                 return first.intValue
             }
-            if let n = exif?[kCGImagePropertyExifISOSpeedRatings] as? NSNumber {
+            if let n = raw as? NSNumber {
                 return n.intValue
             }
             return nil
         }()
-        let shutter: String? = (exif?[kCGImagePropertyExifExposureTime] as? NSNumber).map(rationalString(seconds:))
-        let aperture: String? = (exif?[kCGImagePropertyExifFNumber] as? NSNumber).map { String(format: "%.1f", $0.doubleValue) }
-        let fl: String? = (exif?[kCGImagePropertyExifFocalLength] as? NSNumber).map { String(format: "%.1f mm", $0.doubleValue) }
+        let shutter: String? = (exif?[kCGImagePropertyExifExposureTime as String] as? NSNumber).map(rationalString(seconds:))
+        let aperture: String? = (exif?[kCGImagePropertyExifFNumber as String] as? NSNumber).map { String(format: "%.1f", $0.doubleValue) }
+        let fl: String? = (exif?[kCGImagePropertyExifFocalLength as String] as? NSNumber).map { String(format: "%.1f mm", $0.doubleValue) }
 
         var date: Date? = nil
-        if let ds = exif?[kCGImagePropertyExifDateTimeOriginal] as? String {
+        if let ds = exif?[kCGImagePropertyExifDateTimeOriginal as String] as? String {
             date = parseExifDateTime(ds)
         }
-        if date == nil, let ds = exif?[kCGImagePropertyExifDateTimeDigitized] as? String {
+        if date == nil, let ds = exif?[kCGImagePropertyExifDateTimeDigitized as String] as? String {
             date = parseExifDateTime(ds)
         }
-        if date == nil, let ds = tiff?[kCGImagePropertyTIFFDateTime] as? String {
+        if date == nil, let ds = tiff?[kCGImagePropertyTIFFDateTime as String] as? String {
             date = parseExifDateTime(ds)
         }
 
@@ -79,11 +148,18 @@ enum PhotoScanner {
             || serial != nil || owner != nil || subsec != nil
 
         if !anyTag {
-            return mtimeFallback(url: url)
+            return PhotoMeta(
+                date: fallbackDate(),
+                cameraMake: nil, cameraModel: nil, cameraSerial: nil, cameraOwner: nil,
+                lens: nil,
+                iso: nil, shutter: nil, aperture: nil, focalLength: nil,
+                subSecond: nil,
+                fromExif: false
+            )
         }
-        // If ImageIO resolved some fields but not a date, still fall back to
-        // mtime for the date so folder templates involving {date:...} work.
-        let resolvedDate = date ?? fileMtime(url: url)
+        // If ImageIO resolved some fields but not a date, still fall back
+        // for the date so folder templates involving {date:...} work.
+        let resolvedDate = date ?? fallbackDate()
         return PhotoMeta(
             date: resolvedDate,
             cameraMake: make.nilIfEmpty,

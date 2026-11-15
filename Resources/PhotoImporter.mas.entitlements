@@ -12,6 +12,11 @@
     <true/>
     <key>com.apple.security.files.bookmarks.app-scope</key>
     <true/>
+    <!-- iPhones, iPads and PTP cameras via ImageCaptureCore. Without it the
+         device browser finds nothing under the sandbox (verified; the
+         device.camera entitlement does not help). -->
+    <key>com.apple.security.device.usb</key>
+    <true/>
     <key>com.apple.developer.ubiquity-kvstore-identifier</key>
     <string>MA5JSLK6AZ.com.jianfenglin.photoimporter</string>
 </dict>

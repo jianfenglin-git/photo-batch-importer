@@ -26,10 +26,19 @@ final class AppViewModel: ObservableObject {
     let sequenceStore: SequenceStore
     let presetStore: PresetStore
     let cardAccessStore: CardAccessStore
+    let deviceWatcher: CameraDeviceWatcher
 
-    // Card / scan
+    // Card / device / scan
     @Published var volumes: [Volume] = []
     @Published var selectedVolume: Volume?
+    /// Connected iPhones, iPads and PTP cameras (mirrors `deviceWatcher`).
+    @Published var devices: [CameraDevice] = []
+    /// The selected device, if the source is a device rather than a card.
+    /// Mutually exclusive with `selectedVolume`.
+    @Published var selectedDeviceID: String?
+    /// While camera/lens/exposure details are being read off a device for a
+    /// template that needs them. Nil when idle.
+    @Published var deviceMetadataProgress: MetadataProgress?
     @Published var photos: [PhotoFile] = []
     @Published var scanning: Bool = false
     @Published var scanError: String?
@@ -90,8 +99,9 @@ final class AppViewModel: ObservableObject {
     @Published var presetSaveSheet: PresetSaveSheetState?
     @Published var presetDeleteConfirm: Preset?
     @Published var showAllTokens: Bool = false
-    /// One-time "rate / donate / contact" sheet shown after the first
-    /// fully successful import. See `maybeShowSupportPrompt()`.
+    /// "Rate / donate / contact" sheet, shown once per app version after
+    /// that version's first fully successful import. See
+    /// `maybeShowSupportPrompt()`.
     @Published var showSupportPrompt: Bool = false
 
     // Eject feedback
@@ -104,6 +114,19 @@ final class AppViewModel: ObservableObject {
     private var destinationsTask: Task<Void, Never>?
     private var runOptions: RunOptions?
     private var eligibleSources: [URL] = []
+    /// The loaded catalog of the selected device: its rows plus the handles
+    /// for reading bytes and metadata.
+    private var deviceCatalog: DeviceCatalogHandle?
+    private var deviceMetadataTask: Task<Void, Never>?
+    /// `deviceWatcher.catalogRevision` of the selected device as last listed.
+    private var listedDeviceRevision: Int?
+    /// A selected device that was unplugged, and when. If it comes back
+    /// before anything else is chosen, it's selected again — so "unplug it
+    /// and plug it back in" needs no extra click.
+    private var reselectOnReturn: (id: String, since: Date)?
+    /// Rows of `deviceCatalog` whose full metadata has been requested (and
+    /// merged, if the device had any).
+    @Published private var deviceMetadataFetched: Set<String> = []
     private var cancellables: Set<AnyCancellable> = []
     /// Set while we're assigning published options from an iCloud push, so
     /// the per-field sinks know not to echo the same value back to iCloud
@@ -175,8 +198,12 @@ final class AppViewModel: ObservableObject {
 
     private static let localStateKey = "formState.v1"
     private static let syncedOptionsKey = "options.v1"
-    /// Device-local (UserDefaults, not iCloud) so each Mac asks at most once.
-    private static let supportPromptShownKey = "supportPromptShown.v1"
+    /// The app version (CFBundleShortVersionString) the support sheet was
+    /// last shown for. Device-local (UserDefaults, not iCloud) so each Mac
+    /// asks once per version. Supersedes the 1.0.8 one-time flag
+    /// `supportPromptShown.v1`, which is ignored — so 1.0.8 users see it
+    /// again for 1.0.9.
+    private static let supportPromptVersionKey = "supportPromptShownVersion.v1"
 
     /// Two starter presets seeded on first launch when the user has no
     /// presets yet. The first is the default selection.
@@ -203,6 +230,11 @@ final class AppViewModel: ObservableObject {
         ]
     }
 
+    struct MetadataProgress: Equatable {
+        var done: Int
+        var total: Int
+    }
+
     struct DeleteConfirmState {
         var paths: [URL]
         var verified: Bool
@@ -219,14 +251,17 @@ final class AppViewModel: ObservableObject {
         var verify: Bool
         var deleteAfter: Bool
         var autoEject: Bool
-        var volumeMount: URL
+        /// The card's mount point; nil when importing from a device, which
+        /// is never deleted from or ejected.
+        var volumeMount: URL?
     }
 
-    init(volumeWatcher: VolumeWatcher, sequenceStore: SequenceStore, presetStore: PresetStore, cardAccessStore: CardAccessStore) {
+    init(volumeWatcher: VolumeWatcher, sequenceStore: SequenceStore, presetStore: PresetStore, cardAccessStore: CardAccessStore, deviceWatcher: CameraDeviceWatcher) {
         self.volumeWatcher = volumeWatcher
         self.sequenceStore = sequenceStore
         self.presetStore = presetStore
         self.cardAccessStore = cardAccessStore
+        self.deviceWatcher = deviceWatcher
 
         // Mirror the watcher's list and clear selection when the current
         // volume disappears (ejected / unmounted externally).
@@ -246,6 +281,46 @@ final class AppViewModel: ObservableObject {
                     self.scanning = false
                 }
             }
+            .store(in: &cancellables)
+
+        // Same for devices: mirror the list, drop the selection when the
+        // selected device is unplugged, and take the busy overlay down while
+        // it waits for an unlock (the Photos pane says why instead).
+        deviceWatcher.$devices
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newList in
+                guard let self = self else { return }
+                self.devices = newList
+                if let pending = self.reselectOnReturn,
+                   self.selectedDeviceID == nil, self.selectedVolume == nil,
+                   Date().timeIntervalSince(pending.since) < 600,
+                   let back = newList.first(where: { $0.id == pending.id }) {
+                    self.reselectOnReturn = nil
+                    self.selectDevice(back)
+                    return
+                }
+                guard let id = self.selectedDeviceID else { return }
+                guard let device = newList.first(where: { $0.id == id }) else {
+                    // Not while importing: a cable pulled mid-import fails the
+                    // remaining files, and silently resuming would be a surprise.
+                    self.reselectOnReturn = self.importing ? nil : (id, Date())
+                    self.clearDeviceSelection()
+                    self.photos = []
+                    self.selectedPaths = []
+                    self.scanning = false
+                    return
+                }
+                if case .locked = device.status, self.scanning {
+                    self.scanning = false
+                }
+            }
+            .store(in: &cancellables)
+
+        // The selected device's contents changed — typically its photos
+        // arriving after an unlock. Re-list (batched: they come in bursts).
+        deviceWatcher.$catalogRevision
+            .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.reloadDeviceCatalogIfChanged() }
             .store(in: &cancellables)
 
         // Whenever volume / rules / selection / destination change, rebuild
@@ -277,6 +352,27 @@ final class AppViewModel: ObservableObject {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
+        // Re-prioritize the device metadata queue when the selection
+        // changes while import is still waiting on selected rows.
+        $selectedPaths
+            .dropFirst()
+            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self = self, self.deviceMetadataTask != nil, self.awaitingDeviceMetadata else { return }
+                self.stopDeviceMetadata()
+                self.startDeviceMetadataIfNeeded()
+            }
+            .store(in: &cancellables)
+
+        // A template edited to use camera/lens/exposure tokens while a
+        // device is selected needs those details read off the device.
+        $rules
+            .removeDuplicates()
+            .dropFirst()
+            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .sink { [weak self] _ in self?.startDeviceMetadataIfNeeded() }
             .store(in: &cancellables)
 
         // Live per-row template validation.
@@ -442,6 +538,19 @@ final class AppViewModel: ObservableObject {
     /// Pure form of `usesSequenceToken`, split out so it's testable without
     /// constructing a `@MainActor` view model. `nonisolated` because it
     /// touches no instance state.
+    /// True when an active rule renders a token that, for a device, only
+    /// comes from the per-file metadata request (camera, lens, exposure,
+    /// sub-second). See `DeviceCatalog.needsFullMetadata`.
+    nonisolated static func anyActiveRuleNeedsFullMetadata(_ rules: [TemplateRule]) -> Bool {
+        rules.contains { rule in
+            guard rule.isActive, let segs = try? Template.parse(rule.template) else { return false }
+            return segs.contains { seg in
+                if case .token(let t) = seg { return DeviceCatalog.needsFullMetadata(t) }
+                return false
+            }
+        }
+    }
+
     nonisolated static func anyActiveRuleUsesSequence(_ rules: [TemplateRule]) -> Bool {
         rules.contains { rule in
             guard rule.isActive, let segs = try? Template.parse(rule.template) else { return false }
@@ -540,7 +649,19 @@ final class AppViewModel: ObservableObject {
         let seq = SequenceStore(cloud: cloud)
         let pre = PresetStore(cloud: cloud)
         let cardAccess = CardAccessStore()
-        return AppViewModel(volumeWatcher: vw, sequenceStore: seq, presetStore: pre, cardAccessStore: cardAccess)
+        return AppViewModel(
+            volumeWatcher: vw,
+            sequenceStore: seq,
+            presetStore: pre,
+            cardAccessStore: cardAccess,
+            deviceWatcher: CameraDeviceWatcher()
+        )
+    }
+
+    /// Start looking for iPhones and cameras. Called when the window
+    /// appears (not from init — tests build view models too).
+    func startDeviceDiscovery() {
+        deviceWatcher.start()
     }
 
     // MARK: - Card selection + scan
@@ -550,6 +671,8 @@ final class AppViewModel: ObservableObject {
         // transient card/read error and when a card is rapidly remounted at
         // the same `/Volumes/...` path.
         if selectedVolume?.id == v.id && scanning { return }
+        reselectOnReturn = nil
+        clearDeviceSelection()
         selectedVolume = v
         photos = []
         selectedPaths = []
@@ -714,6 +837,173 @@ final class AppViewModel: ObservableObject {
         return ref
     }
 
+    // MARK: - Device selection
+
+    var selectedDevice: CameraDevice? {
+        guard let id = selectedDeviceID else { return nil }
+        return devices.first(where: { $0.id == id })
+    }
+
+    /// The selected device's catalog has loaded (it may still be empty).
+    var hasDeviceCatalog: Bool { deviceCatalog != nil }
+
+    /// Name used for `{card.label}`: the card's volume name or the device's.
+    var sourceLabel: String {
+        selectedVolume?.label ?? selectedDevice?.name ?? ""
+    }
+
+    func selectDevice(_ d: CameraDevice) {
+        // As with cards, a second click is an explicit retry.
+        if selectedDeviceID == d.id && scanning { return }
+        reselectOnReturn = nil
+        scanTask?.cancel()
+        clearDeviceSelection()
+        selectedVolume = nil
+        selectedDeviceID = d.id
+        photos = []
+        selectedPaths = []
+        destinations = [:]
+        scanError = nil
+        needsCardAccess = false
+        let generation = UUID()
+        scanGeneration = generation
+        scanning = true
+        scanTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                let catalog = try await self.deviceWatcher.loadCatalog(deviceID: d.id)
+                guard self.scanGeneration == generation, self.selectedDeviceID == d.id else { return }
+                self.deviceCatalog = catalog
+                self.listedDeviceRevision = self.deviceWatcher.catalogRevision[d.id] ?? 0
+                self.photos = catalog.photos
+                self.selectedPaths = Set(catalog.photos.map { $0.id })
+                self.scanning = false
+                self.startDeviceMetadataIfNeeded()
+            } catch {
+                guard self.scanGeneration == generation, self.selectedDeviceID == d.id else { return }
+                self.scanning = false
+                self.scanError = error.localizedDescription
+            }
+        }
+    }
+
+    private func clearDeviceSelection() {
+        stopDeviceMetadata()
+        deviceMetadataFetched = []
+        deviceCatalog = nil
+        listedDeviceRevision = nil
+        selectedDeviceID = nil
+    }
+
+    /// Re-list the selected device after its contents changed, keeping what
+    /// can be kept: the selection (all stays all; otherwise the rows still
+    /// there), and any camera details already read. Waits out an import —
+    /// the list isn't swapped under a running copy.
+    private func reloadDeviceCatalogIfChanged() {
+        guard let id = selectedDeviceID, deviceCatalog != nil, !importing,
+              let revision = deviceWatcher.catalogRevision[id], revision != listedDeviceRevision
+        else { return }
+        Task { @MainActor [weak self] in
+            guard let self = self,
+                  let catalog = try? await self.deviceWatcher.loadCatalog(deviceID: id),
+                  self.selectedDeviceID == id, self.deviceCatalog != nil, !self.importing
+            else { return }
+            let hadAll = self.selectedPaths.count == self.photos.count
+            let known = Dictionary(self.photos.map { ($0.id, $0.meta) }, uniquingKeysWith: { a, _ in a })
+            var rows = catalog.photos
+            for i in rows.indices where self.deviceMetadataFetched.contains(rows[i].id) {
+                if let meta = known[rows[i].id] { rows[i].meta = meta }
+            }
+            let ids = Set(rows.map { $0.id })
+            self.stopDeviceMetadata()
+            self.deviceCatalog = catalog
+            self.listedDeviceRevision = revision
+            self.deviceMetadataFetched.formIntersection(ids)
+            self.photos = rows
+            self.selectedPaths = hadAll ? ids : self.selectedPaths.intersection(ids)
+            self.startDeviceMetadataIfNeeded()
+        }
+    }
+
+    private func stopDeviceMetadata() {
+        deviceMetadataTask?.cancel()
+        deviceMetadataTask = nil
+        deviceMetadataProgress = nil
+    }
+
+    /// True while a device is selected, a template needs camera/lens/
+    /// exposure details, and some *selected* row doesn't have them yet.
+    /// Blocks import so files aren't named with "unknown" placeholders.
+    var awaitingDeviceMetadata: Bool {
+        deviceCatalog != nil
+            && Self.anyActiveRuleNeedsFullMetadata(rules)
+            && selectedPaths.contains { !deviceMetadataFetched.contains($0) }
+    }
+
+    /// Read full metadata off the device — selected rows first, so importing
+    /// a few of today's photos doesn't wait on the whole camera roll — one
+    /// request at a time (more in flight is no faster: ~50 files/s either way
+    /// on an iPhone). Merged into `photos` in batches so the Destination
+    /// column fills in as it goes. Stops when no template needs it any more;
+    /// what was already read is kept.
+    private func startDeviceMetadataIfNeeded() {
+        guard let catalog = deviceCatalog, Self.anyActiveRuleNeedsFullMetadata(rules) else {
+            stopDeviceMetadata()
+            return
+        }
+        guard deviceMetadataTask == nil else { return }
+        let fetched = deviceMetadataFetched
+        let pendingRows = photos.filter { !fetched.contains($0.id) }
+        guard !pendingRows.isEmpty else { return }
+        let queue = pendingRows.filter { selectedPaths.contains($0.id) }
+            + pendingRows.filter { !selectedPaths.contains($0.id) }
+        let total = photos.count
+        deviceMetadataProgress = MetadataProgress(done: fetched.count, total: total)
+        deviceMetadataTask = Task { @MainActor [weak self] in
+            var pending: [String: PhotoMeta] = [:]
+            var pendingIDs: [String] = []
+            var lastFlush = Date()
+            for photo in queue {
+                if Task.isCancelled { return }
+                if let props = await catalog.metadata(for: photo.path) {
+                    pending[photo.id] = DeviceCatalog.merging(props, into: photo.meta)
+                }
+                pendingIDs.append(photo.id)
+                guard let self = self, self.deviceCatalog === catalog, !Task.isCancelled else { return }
+                self.deviceMetadataProgress = MetadataProgress(
+                    done: self.deviceMetadataFetched.count + pendingIDs.count,
+                    total: total
+                )
+                // Flush often while selected rows are still missing (that's
+                // what import waits on), every couple of seconds after.
+                let interval: TimeInterval = self.awaitingDeviceMetadata ? 0.5 : 2
+                if Date().timeIntervalSince(lastFlush) > interval {
+                    self.applyDeviceMetadata(pending, fetched: pendingIDs)
+                    pending.removeAll()
+                    pendingIDs.removeAll()
+                    lastFlush = Date()
+                }
+            }
+            guard let self = self, self.deviceCatalog === catalog else { return }
+            self.applyDeviceMetadata(pending, fetched: pendingIDs)
+            self.deviceMetadataProgress = nil
+            self.deviceMetadataTask = nil
+        }
+    }
+
+    /// One batched write to `photos` (each write re-plans the Destination
+    /// column, so per-file updates would redo that thousands of times).
+    private func applyDeviceMetadata(_ metas: [String: PhotoMeta], fetched ids: [String]) {
+        if !metas.isEmpty {
+            var updated = photos
+            for i in updated.indices {
+                if let m = metas[updated[i].id] { updated[i].meta = m }
+            }
+            photos = updated
+        }
+        deviceMetadataFetched.formUnion(ids)
+    }
+
     /// Scan `volume`, holding the security-scoped access token (if any) alive
     /// for the duration so sandboxed reads succeed, then releasing it.
     private func scan(volume v: Volume, access: FolderRef.Resolved?) {
@@ -766,7 +1056,7 @@ final class AppViewModel: ObservableObject {
         // `resolve()` + `startAccessing…`.
         let destPath = destination?.displayPath ?? ""
         let destURL = destPath.isEmpty ? URL(fileURLWithPath: "") : URL(fileURLWithPath: destPath)
-        let cardLabel = selectedVolume?.label ?? ""
+        let cardLabel = sourceLabel
         let seqStart = sequenceStore.nextStart()
         destinationsTask = Task.detached(priority: .utility) { [weak self] in
             let plan = ImportEngine.plan(
@@ -784,6 +1074,10 @@ final class AppViewModel: ObservableObject {
                 if !prefix.isEmpty, rel.hasPrefix(prefix) {
                     rel = String(rel.dropFirst(prefix.count))
                     if rel.hasPrefix("/") { rel.removeFirst() }
+                }
+                for companion in item.companions {
+                    let name = ImportEngine.companionDestination(for: item.dst, companion: companion).lastPathComponent
+                    rel += " + " + name
                 }
                 map[item.src.path] = rel
             }
@@ -992,15 +1286,21 @@ final class AppViewModel: ObservableObject {
     }
 
     var canImport: Bool {
-        selectedVolume != nil &&
+        (selectedVolume != nil || deviceCatalog != nil) &&
             destination != nil &&
             rulesValid &&
             !importing &&
+            !awaitingDeviceMetadata &&
             !selectedPhotos.isEmpty
     }
 
     func startImport() {
-        guard let volume = selectedVolume, let destRef = destination else { return }
+        guard let destRef = destination else { return }
+        // Exactly one source is selected: a card, or a device whose catalog
+        // has loaded.
+        let volume = selectedVolume
+        let device = volume == nil ? deviceCatalog : nil
+        guard volume != nil || device != nil else { return }
         let selected = selectedPhotos
         guard !selected.isEmpty else { return }
 
@@ -1022,7 +1322,7 @@ final class AppViewModel: ObservableObject {
         eligibleSources = []
 
         // Preflight
-        let required: Int64 = selected.reduce(into: 0) { $0 &+= $1.sizeBytes }
+        let required: Int64 = selected.reduce(into: 0) { $0 &+= $1.totalBytes }
         do {
             let pf = try PreflightService.check(destination: dest, requiredBytes: required)
             if !pf.ok {
@@ -1052,11 +1352,14 @@ final class AppViewModel: ObservableObject {
             return
         }
 
+        // Deleting from and ejecting a device aren't supported: on an
+        // iPhone a delete removes the whole Photos item (Live Photo video,
+        // edits, and with iCloud Photos on, every copy everywhere).
         runOptions = RunOptions(
             verify: verify,
-            deleteAfter: deleteAfter,
-            autoEject: autoEject,
-            volumeMount: volume.mountPoint
+            deleteAfter: deleteAfter && volume != nil,
+            autoEject: autoEject && volume != nil,
+            volumeMount: volume?.mountPoint
         )
 
         let seqStart = sequenceStore.nextStart()
@@ -1065,18 +1368,25 @@ final class AppViewModel: ObservableObject {
             verify: verify,
             hashAlgorithm: hashAlgorithm
         )
-        let cardLabel = volume.label
+        let cardLabel = sourceLabel
+        let source: ImportSource = device?.importSource ?? FileImportSource()
 
         // Hold the card's security scope (if sandboxed) for the whole import
-        // so reading source files off the card succeeds. nil in dev builds.
-        let cardAccess = cardAccessStore.resolve(forMountPath: volume.mountPoint.path)
-        guard cardAccess != nil || !Sandbox.isActive else {
+        // so reading source files off the card succeeds. nil in dev builds,
+        // and for devices, which need no file-system grant.
+        let cardAccess = volume.flatMap { cardAccessStore.resolve(forMountPath: $0.mountPoint.path) }
+        guard cardAccess != nil || !Sandbox.isActive || volume == nil else {
             scopeTokens.forEach { $0.stop() }
             destResolved.stop()
             importing = false
             scanError = "Card access expired — click the card again and grant access before importing."
             return
         }
+
+        // Selected rows already have their details (import waits for that);
+        // reading the rest of the roll now would compete with the copy for
+        // the same USB link. Resumed when the import finishes.
+        stopDeviceMetadata()
 
         // Capture the scope tokens in the closure so they stay alive for
         // the whole two-phase import; they auto-stop on deinit at the end.
@@ -1108,7 +1418,7 @@ final class AppViewModel: ObservableObject {
 
             // Phase 1: primary.
             var primaryEligible: Set<URL> = []
-            let primaryResult = ImportEngine.executePrimary(plan: plan, options: options) { progress in
+            let primaryResult = ImportEngine.executePrimary(plan: plan, options: options, source: source) { progress in
                 if progress.outcome.isEligibleForDelete {
                     primaryEligible.insert(progress.currentSrc)
                 }
@@ -1135,10 +1445,10 @@ final class AppViewModel: ObservableObject {
                     // tracks just this phase.
                     let backupItems = plan.items.filter { $0.backupDst != nil }
                     self?.totalItemsPlanned = backupItems.count
-                    self?.totalBytesPlanned = backupItems.reduce(Int64(0)) { $0 &+ $1.sizeBytes }
+                    self?.totalBytesPlanned = backupItems.reduce(Int64(0)) { $0 &+ $1.totalBytes }
                     self?.progress = nil
                 }
-                let backupResult = ImportEngine.executeBackup(plan: plan, options: options) { progress in
+                let backupResult = ImportEngine.executeBackup(plan: plan, options: options, source: source) { progress in
                     if progress.outcome.isEligibleForDelete {
                         backupEligible.insert(progress.currentSrc)
                     }
@@ -1158,28 +1468,27 @@ final class AppViewModel: ObservableObject {
             // through both phases.
             await MainActor.run {
                 guard let self = self else { return }
-                let sourcesRequiringBackup = Set(plan.items.compactMap { item in
-                    item.backupDst == nil ? nil : item.src
-                })
-                let localEligible = plan.items.compactMap { item -> URL? in
-                    guard primaryEligible.contains(item.src) else { return nil }
-                    guard !sourcesRequiringBackup.contains(item.src) || backupEligible.contains(item.src) else { return nil }
-                    return item.src
-                }
+                let localEligible = Self.deleteEligibleSources(
+                    plan: plan,
+                    primaryEligible: primaryEligible,
+                    backupEligible: backupEligible
+                )
                 self.importing = false
                 self.currentPhase = nil
                 self.phaseMessage = "All done."
                 self.eligibleSources = localEligible
+                self.startDeviceMetadataIfNeeded()
+                self.reloadDeviceCatalogIfChanged()
                 self.supportPromptDue = self.importResult?.isFullySuccessful == true
-                if let opts = self.runOptions {
+                if let opts = self.runOptions, let mount = opts.volumeMount {
                     if opts.deleteAfter && !localEligible.isEmpty {
                         self.deleteConfirm = DeleteConfirmState(
                             paths: localEligible,
                             verified: opts.verify,
-                            volumeMount: opts.volumeMount
+                            volumeMount: mount
                         )
                     } else if opts.autoEject {
-                        self.doEject(mountPoint: opts.volumeMount)
+                        self.doEject(mountPoint: mount)
                     }
                 }
                 // With delete-after on, the delete-confirm sheet is up; the
@@ -1193,6 +1502,12 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - Support prompt
 
+    /// Once per marketing version: a new release (1.0.9 → 1.0.10) asks again;
+    /// another TestFlight build of the same version doesn't.
+    nonisolated static func shouldShowSupportPrompt(lastShownVersion: String?, currentVersion: String) -> Bool {
+        lastShownVersion != currentVersion
+    }
+
     /// Set when the latest import finished with no failures; consumed by
     /// `maybeShowSupportPrompt()` once no other sheet is in the way.
     private var supportPromptDue = false
@@ -1201,8 +1516,12 @@ final class AppViewModel: ObservableObject {
         guard supportPromptDue else { return }
         supportPromptDue = false
         let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: Self.supportPromptShownKey) else { return }
-        defaults.set(true, forKey: Self.supportPromptShownKey)
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        guard Self.shouldShowSupportPrompt(
+            lastShownVersion: defaults.string(forKey: Self.supportPromptVersionKey),
+            currentVersion: version
+        ) else { return }
+        defaults.set(version, forKey: Self.supportPromptVersionKey)
         // Short delay so a just-dismissed sheet (delete confirm) finishes
         // animating out before this one is presented.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -1211,6 +1530,24 @@ final class AppViewModel: ObservableObject {
     }
 
     // MARK: - Post-import delete
+
+    /// Source files safe to delete after an import: copied (or found
+    /// identical) in the primary phase and, when their rule has a backup
+    /// folder, in the backup phase too. Companions (a Live Photo's video, an
+    /// `.AAE`) are judged on their own outcome, with their photo's backup
+    /// requirement, so a card isn't left holding stray sidecars.
+    nonisolated static func deleteEligibleSources(
+        plan: ImportPlan,
+        primaryEligible: Set<URL>,
+        backupEligible: Set<URL>
+    ) -> [URL] {
+        plan.items.flatMap { item -> [URL] in
+            let needsBackup = item.backupDst != nil
+            return ([item.src] + item.companions.map { $0.path }).filter { src in
+                primaryEligible.contains(src) && (!needsBackup || backupEligible.contains(src))
+            }
+        }
+    }
 
     func confirmDelete() {
         guard let state = deleteConfirm else { return }

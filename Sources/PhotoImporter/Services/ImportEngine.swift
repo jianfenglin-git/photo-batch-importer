@@ -10,10 +10,11 @@ struct CompiledRule {
 }
 
 /// Plan + execute an import in two independent phases (primary then backup).
-/// Each phase reads from the SD card separately so the user can start using
-/// the primary copies while the slower backup copy is in progress.
+/// Each phase reads from the source (card or device) separately so the user
+/// can start using the primary copies while the slower backup copy is in
+/// progress.
 enum ImportEngine {
-    /// Read/write granularity for the streaming copy and hash loops.
+    /// Read granularity when hashing a local destination file.
     private static let chunkSize = 64 * 1024
 
     /// Build an execution plan: filter every photo against the rule list
@@ -66,13 +67,14 @@ enum ImportEngine {
             let rel = Template.evaluate(rule.segments, photo: photo, seq: seq, cardLabel: cardLabel)
             let dst = destination.appendingPathComponent(rel)
             let backup = rule.backupFolder?.appendingPathComponent(rel)
-            totalBytes &+= photo.sizeBytes
+            totalBytes &+= photo.totalBytes
             items.append(ImportItem(
                 src: photo.path,
                 dst: dst,
                 seq: seq,
                 sizeBytes: photo.sizeBytes,
-                backupDst: backup
+                backupDst: backup,
+                companions: photo.companions
             ))
         }
         return ImportPlan(items: items, totalBytes: totalBytes)
@@ -82,9 +84,10 @@ enum ImportEngine {
     static func executePrimary(
         plan: ImportPlan,
         options: ImportOptions,
+        source: ImportSource = FileImportSource(),
         onProgress: (ImportProgress) -> Void
     ) -> ImportResult {
-        executePhase(plan: plan, phase: .primary, options: options, onProgress: onProgress)
+        executePhase(plan: plan, phase: .primary, options: options, source: source, onProgress: onProgress)
     }
 
     /// Phase 2: source → backup, for the subset of items that have a
@@ -94,6 +97,7 @@ enum ImportEngine {
     static func executeBackup(
         plan: ImportPlan,
         options: ImportOptions,
+        source: ImportSource = FileImportSource(),
         onProgress: (ImportProgress) -> Void
     ) -> ImportResult? {
         // Rewrite each backup-eligible item so `dst` points at the backup
@@ -107,13 +111,23 @@ enum ImportEngine {
                 dst: backupDst,
                 seq: item.seq,
                 sizeBytes: item.sizeBytes,
-                backupDst: nil
+                backupDst: nil,
+                companions: item.companions
             )
         }
         guard !mapped.isEmpty else { return nil }
-        let totalBytes = mapped.reduce(Int64(0)) { $0 &+ $1.sizeBytes }
+        let totalBytes = mapped.reduce(Int64(0)) { $0 &+ $1.totalBytes }
         let phasePlan = ImportPlan(items: mapped, totalBytes: totalBytes)
-        return executePhase(plan: phasePlan, phase: .backup, options: options, onProgress: onProgress)
+        return executePhase(plan: phasePlan, phase: .backup, options: options, source: source, onProgress: onProgress)
+    }
+
+    /// Where a companion lands, given where its photo actually landed:
+    /// `…/IMG_000123.HEIC` → `…/IMG_000123_live.MOV`.
+    static func companionDestination(for photoDestination: URL, companion: CompanionFile) -> URL {
+        let stem = photoDestination.deletingPathExtension().lastPathComponent
+        let ext = companion.path.pathExtension
+        let name = ext.isEmpty ? stem + companion.suffix : "\(stem)\(companion.suffix).\(ext)"
+        return photoDestination.deletingLastPathComponent().appendingPathComponent(name)
     }
 
     // MARK: - Shared per-item executor
@@ -122,47 +136,96 @@ enum ImportEngine {
         plan: ImportPlan,
         phase: ImportPhase,
         options: ImportOptions,
+        source: ImportSource,
         onProgress: (ImportProgress) -> Void
     ) -> ImportResult {
         var result = ImportResult()
         let totalItems = plan.items.count
         var bytesDone: Int64 = 0
-        for (i, item) in plan.items.enumerated() {
-            // Per-item pool as defense in depth: catches autoreleased objects
-            // from path manipulation and FileManager calls, which would
-            // otherwise also accumulate across the whole phase.
-            let step = autoreleasepool { executeItem(item, options: options) }
-            switch step.outcome {
-            case .copied, .copiedAs:
-                result.copied += 1
-            case .skippedIdentical, .skippedExisting:
-                result.skipped += 1
-            case .overwritten:
-                result.overwritten += 1
-            case .verifyFailed:
-                result.verifyFailed += 1
-                result.failed += 1
-                result.failures.append((item.src, "verify hash mismatch"))
-            case .failed(let msg):
-                result.failed += 1
-                result.failures.append((item.src, msg))
-            }
-            if step.verified {
-                result.verified += 1
-            }
-            bytesDone &+= item.sizeBytes
+        func report(_ i: Int, src: URL, dst: URL, outcome: ImportOutcome) {
             onProgress(ImportProgress(
                 phase: phase,
                 itemIndex: i,
                 totalItems: totalItems,
                 bytesDone: bytesDone,
                 bytesTotal: plan.totalBytes,
-                currentSrc: item.src,
-                currentDst: item.dst,
-                outcome: step.outcome
+                currentSrc: src,
+                currentDst: dst,
+                outcome: outcome
             ))
         }
+        for (i, item) in plan.items.enumerated() {
+            // Per-item pool as defense in depth: catches autoreleased objects
+            // from path manipulation and FileManager calls, which would
+            // otherwise also accumulate across the whole phase.
+            let step = autoreleasepool { executeItem(item, options: options, source: source) }
+            record(step, src: item.src, into: &result)
+            bytesDone &+= item.sizeBytes
+            report(i, src: item.src, dst: item.dst, outcome: step.outcome)
+
+            // Companions follow the photo to wherever it actually landed, so
+            // a photo renamed to `-2` on collision keeps its Live Photo video
+            // beside it. Each still goes through the full collision/verify
+            // path in its own right.
+            let landed = landedURL(intended: item.dst, outcome: step.outcome)
+            for companion in item.companions {
+                let companionStep: Step
+                let companionDst: URL
+                if let landed {
+                    companionDst = companionDestination(for: landed, companion: companion)
+                    let companionItem = ImportItem(
+                        src: companion.path,
+                        dst: companionDst,
+                        seq: item.seq,
+                        sizeBytes: companion.sizeBytes
+                    )
+                    companionStep = autoreleasepool {
+                        executeItem(companionItem, options: options, source: source)
+                    }
+                } else {
+                    companionDst = companionDestination(for: item.dst, companion: companion)
+                    companionStep = Step(outcome: .failed("not copied because its photo failed"), verified: false)
+                }
+                record(companionStep, src: companion.path, into: &result)
+                bytesDone &+= companion.sizeBytes
+                report(i, src: companion.path, dst: companionDst, outcome: companionStep.outcome)
+            }
+        }
         return result
+    }
+
+    private static func record(_ step: Step, src: URL, into result: inout ImportResult) {
+        switch step.outcome {
+        case .copied, .copiedAs:
+            result.copied += 1
+        case .skippedIdentical, .skippedExisting:
+            result.skipped += 1
+        case .overwritten:
+            result.overwritten += 1
+        case .verifyFailed:
+            result.verifyFailed += 1
+            result.failed += 1
+            result.failures.append((src, "verify hash mismatch"))
+        case .failed(let msg):
+            result.failed += 1
+            result.failures.append((src, msg))
+        }
+        if step.verified {
+            result.verified += 1
+        }
+    }
+
+    /// Where an item's content now lives at the destination, or nil when it
+    /// didn't make it there intact.
+    private static func landedURL(intended: URL, outcome: ImportOutcome) -> URL? {
+        switch outcome {
+        case .copied, .overwritten, .skippedIdentical, .skippedExisting:
+            return intended
+        case .copiedAs(let alt):
+            return alt
+        case .verifyFailed, .failed:
+            return nil
+        }
     }
 
     private struct Step {
@@ -170,9 +233,9 @@ enum ImportEngine {
         var verified: Bool
     }
 
-    private static func executeItem(_ item: ImportItem, options: ImportOptions) -> Step {
+    private static func executeItem(_ item: ImportItem, options: ImportOptions, source: ImportSource) -> Step {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: item.src.path) else {
+        guard source.exists(item.src) else {
             return Step(outcome: .failed("source not found"), verified: false)
         }
         let parent = item.dst.deletingLastPathComponent()
@@ -183,26 +246,26 @@ enum ImportEngine {
         }
 
         if !fm.fileExists(atPath: item.dst.path) {
-            return copyAndMaybeVerify(src: item.src, dst: item.dst, options: options, onSuccess: .copied)
+            return copyAndMaybeVerify(src: item.src, dst: item.dst, options: options, source: source, onSuccess: .copied)
         }
         switch options.collisionPolicy {
         case .overwrite:
-            return copyAndMaybeVerify(src: item.src, dst: item.dst, options: options, onSuccess: .overwritten)
+            return copyAndMaybeVerify(src: item.src, dst: item.dst, options: options, source: source, onSuccess: .overwritten)
         case .skipAll:
             return Step(outcome: .skippedExisting, verified: false)
         case .renameIfDifferent:
             let alt = nextAvailable(item.dst)
-            return copyAndMaybeVerify(src: item.src, dst: alt, options: options, onSuccess: .copiedAs(alt))
+            return copyAndMaybeVerify(src: item.src, dst: alt, options: options, source: source, onSuccess: .copiedAs(alt))
         case .skipSameHash:
             // Cheap size gate before two full reads. Different lengths can't
             // be the same file, so this skips ~2x I/O in the common
             // "different photo, same name" case. When either size is
             // unreadable, fall through and let the hashes decide.
-            if let srcSize = fileSize(item.src),
+            if let srcSize = source.size(of: item.src),
                let dstSize = fileSize(item.dst),
                srcSize != dstSize {
                 let alt = nextAvailable(item.dst)
-                return copyAndMaybeVerify(src: item.src, dst: alt, options: options, onSuccess: .copiedAs(alt))
+                return copyAndMaybeVerify(src: item.src, dst: alt, options: options, source: source, onSuccess: .copiedAs(alt))
             }
             // Deliberately SHA-256 regardless of the user's choice. A false
             // "identical" verdict here is destructive: `.skippedIdentical` is
@@ -211,7 +274,7 @@ enum ImportEngine {
             // applies to the verify pass, which only ever compares a file
             // against bytes we just wrote, and where a mismatch merely
             // reports a failure.
-            guard let srcHash = try? hashFile(item.src, algorithm: .sha256) else {
+            guard let srcHash = try? hashSource(item.src, source: source, algorithm: .sha256) else {
                 return Step(outcome: .failed("hash src"), verified: false)
             }
             guard let dstHash = try? hashFile(item.dst, algorithm: .sha256) else {
@@ -221,7 +284,7 @@ enum ImportEngine {
                 return Step(outcome: .skippedIdentical, verified: false)
             }
             let alt = nextAvailable(item.dst)
-            return copyAndMaybeVerify(src: item.src, dst: alt, options: options, onSuccess: .copiedAs(alt))
+            return copyAndMaybeVerify(src: item.src, dst: alt, options: options, source: source, onSuccess: .copiedAs(alt))
         }
     }
 
@@ -231,16 +294,18 @@ enum ImportEngine {
         src: URL,
         dst: URL,
         options: ImportOptions,
+        source: ImportSource,
         onSuccess: ImportOutcome
     ) -> Step {
         let srcHash: Data
         do {
             srcHash = try streamingCopyAndHash(
-                src: src, dst: dst, algorithm: options.hashAlgorithm
+                src: src, dst: dst, algorithm: options.hashAlgorithm, source: source
             )
         } catch {
             return Step(outcome: .failed("copy: \(error.localizedDescription)"), verified: false)
         }
+        stampDates(source.dates(of: src), on: dst)
         if !options.verify {
             return Step(outcome: onSuccess, verified: false)
         }
@@ -251,6 +316,18 @@ enum ImportEngine {
             return Step(outcome: onSuccess, verified: true)
         }
         return Step(outcome: .verifyFailed, verified: false)
+    }
+
+    /// Give the copy its source's creation and modification dates, as a
+    /// Finder copy does. Without this, Finder's Date Modified/Created show
+    /// the import time. Best effort: a filesystem that refuses the dates
+    /// still has a good copy.
+    private static func stampDates(_ dates: SourceDates, on dst: URL) {
+        var attrs: [FileAttributeKey: Any] = [:]
+        if let modified = dates.modified { attrs[.modificationDate] = modified }
+        if let created = dates.created { attrs[.creationDate] = created }
+        guard !attrs.isEmpty else { return }
+        try? FileManager.default.setAttributes(attrs, ofItemAtPath: dst.path)
     }
 
     /// Byte length of a file, or nil if it can't be read. Callers treat nil
@@ -293,17 +370,16 @@ enum ImportEngine {
     private static func streamingCopyAndHash(
         src: URL,
         dst: URL,
-        algorithm: HashAlgorithm
+        algorithm: HashAlgorithm,
+        source: ImportSource
     ) throws -> Data {
         let fm = FileManager.default
-        let reader = try FileHandle(forReadingFrom: src)
-        defer { try? reader.close() }
-        // Length of exactly the file we're about to read, from the same
-        // descriptor rather than a separate stat, so nothing can swap the
-        // file out in between. Not `item.sizeBytes` — that was measured at
-        // scan time and may be stale.
-        let expectedBytes = try reader.seekToEnd()
-        try reader.seek(toOffset: 0)
+        let reader = try source.open(src)
+        defer { reader.close() }
+        // The reader reports the length of exactly what it's about to stream
+        // (an fstat of the open descriptor for a card, the size the device
+        // reported for an iPhone/camera).
+        let expectedBytes = reader.length
         if !fm.fileExists(atPath: dst.path) {
             guard fm.createFile(atPath: dst.path, contents: nil) else {
                 throw NSError(
@@ -324,13 +400,13 @@ enum ImportEngine {
         var xx = XXHash64()
         var written: UInt64 = 0
         while true {
-            // `read(upToCount:)` bridges -[NSFileHandle readDataOfLength:],
-            // whose NSData is autoreleased. The whole phase runs as one
-            // Swift concurrency job with no suspension point, so without an
+            // Readers hand back autoreleased NSData (FileHandle and
+            // ImageCaptureCore both do). The whole phase runs as one Swift
+            // concurrency job with no suspension point, so without an
             // explicit pool every chunk of every file would be held until
             // the import finished — one byte of RAM per byte copied.
             let count: Int = try autoreleasepool {
-                let chunk = try reader.read(upToCount: chunkSize) ?? Data()
+                let chunk = try reader.read()
                 if chunk.isEmpty { return 0 }
                 switch algorithm {
                 case .sha256: sha.update(data: chunk)
@@ -368,6 +444,31 @@ enum ImportEngine {
                 userInfo: [NSLocalizedDescriptionKey:
                     "destination is \(landed) bytes, expected \(expectedBytes)"]
             )
+        }
+        switch algorithm {
+        case .sha256: return Data(sha.finalize())
+        case .xxhash64: return xx.finalizeData()
+        }
+    }
+
+    /// Hash a source through its `ImportSource` — for a device that means
+    /// reading the file off the device again.
+    private static func hashSource(_ url: URL, source: ImportSource, algorithm: HashAlgorithm) throws -> Data {
+        let reader = try source.open(url)
+        defer { reader.close() }
+        var sha = SHA256()
+        var xx = XXHash64()
+        while true {
+            let done: Bool = try autoreleasepool {
+                let chunk = try reader.read()
+                if chunk.isEmpty { return true }
+                switch algorithm {
+                case .sha256: sha.update(data: chunk)
+                case .xxhash64: xx.update(data: chunk)
+                }
+                return false
+            }
+            if done { break }
         }
         switch algorithm {
         case .sha256: return Data(sha.finalize())

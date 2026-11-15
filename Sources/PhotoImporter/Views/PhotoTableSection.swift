@@ -9,6 +9,8 @@ struct PhotoRow: Identifiable, Hashable {
     var sortDate: Date { photo.meta.date ?? .distantPast }
     var fileName: String { photo.path.lastPathComponent }
     var fileExt: String { photo.path.pathExtension.uppercased() }
+    var isLivePhoto: Bool { photo.companions.contains { $0.isLivePhotoVideo } }
+    var hasEdits: Bool { photo.companions.contains { !$0.isLivePhotoVideo } }
 }
 
 struct PhotoTableSection: View {
@@ -21,8 +23,27 @@ struct PhotoTableSection: View {
     /// previously all collapsed to "Scanning…": no card, awaiting a sandbox
     /// access grant, an error, an in-flight scan, and a genuinely empty card.
     private var emptyStateMessage: String {
+        if let device = vm.selectedDevice {
+            if let err = vm.scanError {
+                return err
+            }
+            switch device.status {
+            case .locked:
+                return "Unlock “\(device.name)” to see its photos. If it asks whether to trust this computer, tap Trust."
+            case .failed(let message):
+                return message
+            case .hidden:
+                return "No photos visible on “\(device.name)”. If it’s locked, unlock it — its photos will appear here on their own."
+            case .needsReplug:
+                return "“\(device.name)” is unlocked but isn’t showing any photos — this can happen after it has been locked for a while. If it has photos, unplug it and plug it back in; they’ll load here on their own."
+            case .ready where vm.hasDeviceCatalog:
+                return "No photos or videos found on “\(device.name)”."
+            case .idle, .connecting, .ready:
+                return "Reading “\(device.name)”…"
+            }
+        }
         if vm.selectedVolume == nil {
-            return "Select a card to list its photos."
+            return "Select a card or device to list its photos."
         }
         if vm.needsCardAccess {
             return "Waiting for permission to read this card…"
@@ -96,11 +117,25 @@ struct PhotoTableSection: View {
                 .width(min: 100, ideal: 100, max: 400)
 
                 TableColumn("Type", value: \.fileExt) { row in
-                    Text(row.fileExt)
-                        .font(.system(size: 11, design: .monospaced).weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 3) {
+                        Text(row.fileExt)
+                            .font(.system(size: 11, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        if row.isLivePhoto {
+                            Image(systemName: "livephoto")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .help("Live Photo: its video is imported alongside, named …_live.MOV")
+                        }
+                        if row.hasEdits {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .help("Edited: its .AAE edit file is imported alongside, under the same name")
+                        }
+                    }
                 }
-                .width(min: 46, ideal: 46, max: 80)
+                .width(min: 46, ideal: 74, max: 100)
 
                 TableColumn("Destination file name", value: \.destination) { row in
                     Text(row.destination.isEmpty ? "—" : row.destination)

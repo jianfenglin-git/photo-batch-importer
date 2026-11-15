@@ -20,6 +20,14 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# The Command Line Tools for macOS 27 ship without SwiftUI's macro plugin, so
+# `@State` fails to expand ("plugin for module 'SwiftUIMacros' not found").
+# Build with full Xcode's toolchain when it's installed and the caller hasn't
+# picked one.
+if [[ -z "${DEVELOPER_DIR:-}" && -d /Applications/Xcode.app/Contents/Developer ]]; then
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
 # Force a relink so the -sectcreate'd Info.plist is current (see build_mas.sh).
 find .build -type f \( -name PhotoImporter -o -name PhotoImporterHelper \) \
     -path "*/$CONFIG/*" -delete 2>/dev/null || true

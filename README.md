@@ -1,17 +1,24 @@
 # Photo Batch Importer
 
-Native macOS app for importing photos from SD/CF cards with EXIF-driven naming
-rules. Pure SwiftUI + Foundation — no WebView, no bundled exiftool, no Node, 
+Native macOS app for importing photos from SD/CF cards, iPhones, iPads and
+USB cameras with EXIF-driven naming rules. Pure SwiftUI + Foundation — no WebView, no bundled exiftool, no Node, 
 small and fast.
 
 ## Features
 
 - Auto-detect inserted/ejected removable volumes (`NSWorkspace` notifications).
+- Import straight from a connected iPhone, iPad or USB camera (PTP), the way
+  Image Capture does — via `ImageCaptureCore`, with the same naming rules,
+  dated folders, collision handling, verify and backup as a card. Live Photos
+  come across as the photo plus its video, named after the photo:
+  `IMG_000123.HEIC` + `IMG_000123_live.MOV`. Edits come along as the `.AAE`
+  file under the photo's exact name (`IMG_000123.AAE`), on a card too.
+  Nothing is ever deleted from the device.
 - EXIF photo properties via macOS `ImageIO` — JPEG, TIFF, PNG, HEIC, CR2/CR3, 
   NEF, ARW, DNG, RAF, and everything else the system supports natively.
 - Persistent monotonic sequence counter across runs.
 - Template-driven naming with properties for date, time, camera, lens, exposure,
-  file name, sequence counter, card label.
+  file name, sequence counter, card or device name.
 - Sort-able, multi-select photo table (Cmd/Shift-click for modifier select),
   live "Destination file name" preview column.
 - Option to verify every copied file against the source and confirm no data
@@ -152,6 +159,8 @@ Sources/PhotoImporter/
     Template.swift                  Naming DSL parser + evaluator
   Services/
     VolumeWatcher.swift             NSWorkspace-driven volume list
+    CameraDevices.swift             iPhone/camera discovery + streaming (ImageCaptureCore)
+    ImportSource.swift              Card vs. device byte sources for the engine
     PhotoScanner.swift              ImageIO EXIF extraction
     ImportEngine.swift              Plan + execute + verify
     XXHash64.swift                  Streaming XXH64 (non-cryptographic)
@@ -180,7 +189,8 @@ Resources/
 Scripts/
   build_app.sh                      Build + bundle into .app (local dev)
   build_mas.sh                      Signed universal .app + .pkg for the App Store
-Tests/PhotoImporterTests/           swift test (47 tests)
+  build_all.sh                      Both: App Store .pkg + local test app
+Tests/PhotoImporterTests/           swift test (73 tests + 2 opt-in hardware tests)
 ```
 
 ## Persistent state
@@ -193,12 +203,24 @@ delete to reset.
 
 ## Tests
 
-Tests are written with `swift-testing` (`import Testing`), which ships with
-Xcode but not with the plain Command Line Tools. The test target in
-`Package.swift` is commented out until you have Xcode installed; re-enable
-it and run `swift test`.
+Tests are written with `swift-testing` (`import Testing`). Run them with
+Xcode's toolchain — the macOS 27 Command Line Tools lack SwiftUI's macro
+plugin, so the app target doesn't compile with them:
 
-Test coverage: template parsing + evaluation (including the `/` sanitization 
-regression), import plan (including dual-format JPG+RAW pair detection), 
-sequence and preset store persistence, and an ImageIO regression against the 
-original test fixtures.
+    DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+
+(The build scripts pick Xcode's toolchain automatically.)
+
+Test coverage: template parsing + evaluation (including the `/` sanitization
+regression), import plan (including dual-format JPG+RAW pair detection),
+sequence and preset store persistence, an ImageIO regression against the
+original test fixtures, and device import without hardware (catalog mapping,
+Live Photo companions, streaming from a non-file source, short reads).
+
+With an unlocked iPhone (or PTP camera) connected, two more tests import a
+sample from it through the real code path and compare every file
+byte-for-byte with ImageCaptureCore's own download. They only read from the
+device:
+
+    PI_DEVICE_TEST=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+        swift test --filter DeviceHardware

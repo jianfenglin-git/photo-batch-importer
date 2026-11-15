@@ -47,8 +47,11 @@ struct ContentView: View {
         // Busy overlay while scanning: dims the UI, absorbs clicks, and
         // shows a spinner so the user gets immediate feedback on card
         // selection (scanning can take several seconds on a big card).
+        // Cards only: a device lists in a fraction of a second, and one
+        // stuck behind a "Trust This Computer?" prompt on the phone must not
+        // leave the window blocked — the Photos pane says it's reading.
         .overlay {
-            if vm.scanning {
+            if vm.scanning && vm.selectedDeviceID == nil {
                 ZStack {
                     Color.black.opacity(0.15)
                     ProgressView()
@@ -89,6 +92,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $vm.showAllTokens) { AllTokensSheet() }
         .sheet(isPresented: $vm.showSupportPrompt) { SupportPromptSheet() }
+        .onAppear { vm.startDeviceDiscovery() }
     }
 }
 
@@ -126,8 +130,8 @@ private struct CardSection: View {
     var body: some View {
         SectionHeader {
             HStack {
-                Text("Card").sectionStyle()
-                Text("\(vm.volumes.count) detected")
+                Text("Card or device").sectionStyle()
+                Text("\(vm.volumes.count + vm.devices.count) detected")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -135,14 +139,76 @@ private struct CardSection: View {
                     .controlSize(.small)
             }
         }
-        if vm.volumes.isEmpty {
-            Text("No removable volumes. Insert a card and click Refresh.")
+        if vm.volumes.isEmpty && vm.devices.isEmpty {
+            Text("No cards or devices. Insert a card, or connect an iPhone, iPad or camera with a USB cable.")
                 .foregroundStyle(.secondary)
                 .font(.system(size: 12))
         } else {
             ForEach(vm.volumes) { volume in
                 CardRow(volume: volume)
             }
+            ForEach(vm.devices) { device in
+                DeviceRow(device: device)
+            }
+        }
+    }
+}
+
+/// A connected iPhone, iPad or PTP camera. Styled like `CardRow`, minus the
+/// capacity and Eject button, which don't apply.
+private struct DeviceRow: View {
+    let device: CameraDevice
+    @EnvironmentObject private var vm: AppViewModel
+
+    var body: some View {
+        let isSelected = vm.selectedDeviceID == device.id
+
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: device.symbolName)
+                .font(.system(size: 18))
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(device.name)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+                Text(statusText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(statusIsProblem ? Color.red : Color.secondary)
+                    .lineLimit(2)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.15) : Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(isSelected ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: isSelected ? 2 : 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { vm.selectDevice(device) }
+    }
+
+    private var statusText: String {
+        switch device.status {
+        case .idle: return "Connected by USB"
+        case .connecting: return "Connecting…"
+        case .locked(let message): return message
+        case .ready(let count): return "\(count.formatted()) item\(count == 1 ? "" : "s")"
+        case .hidden: return "No photos visible yet. Unlock it to see them."
+        case .needsReplug: return "Unlocked, but it isn’t showing any photos. If it has some, unplug it and plug it back in."
+        case .failed(let message): return message
+        }
+    }
+
+    private var statusIsProblem: Bool {
+        switch device.status {
+        case .locked, .failed, .needsReplug: return true
+        case .idle, .connecting, .ready, .hidden: return false
         }
     }
 }
@@ -588,8 +654,16 @@ private struct OptionsSection: View {
         }
         Toggle("Permanently delete from card after import (confirms before deleting)", isOn: $vm.deleteAfter)
             .controlSize(.small)
+            .disabled(vm.selectedDeviceID != nil)
         Toggle("Eject card after import", isOn: $vm.autoEject)
             .controlSize(.small)
+            .disabled(vm.selectedDeviceID != nil)
+        if vm.selectedDeviceID != nil {
+            Text("Deleting and ejecting apply to cards only. Nothing is removed from an iPhone, iPad or camera.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 18)
+        }
 
         if loginItem.isAvailable {
             Toggle("Open this app automatically when a card is inserted", isOn: Binding(
@@ -657,7 +731,11 @@ private struct ActionsSection: View {
             .controlSize(.large)
             .disabled(!vm.canImport)
 
-            if let msg = vm.phaseMessage {
+            if let p = vm.deviceMetadataProgress, !vm.importing {
+                Text("Reading photo details for the naming template… \(p.done) of \(p.total)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            } else if let msg = vm.phaseMessage {
                 Text(msg)
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)

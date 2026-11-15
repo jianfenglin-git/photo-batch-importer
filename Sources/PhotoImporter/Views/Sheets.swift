@@ -161,12 +161,12 @@ struct SupportPromptSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Your first import is done!")
+            Text("Your import is done!")
                 .font(.headline)
             Text("Thanks for using Photo Batch Importer. If it's working well for you, a rating on the App Store helps other photographers find it.")
             Text("It's built and maintained by one developer. If you find it useful, you can buy me a coffee or help cover the yearly Apple Developer fee through PayPal.")
             Text(supportLine)
-            Text("To reduce interruption, this dialog only shows once after the first import, but you can find the same information in the About dialog from the menu bar.")
+            Text("To reduce interruption, this dialog only shows once per version, after the first import, but you can find the same information in the About dialog from the menu bar.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             HStack {

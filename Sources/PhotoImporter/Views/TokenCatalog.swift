@@ -72,7 +72,7 @@ enum TokenCatalog {
             .init(label: "{seq:000000}", token: "{seq:000000}", description: "000001, 000002, …"),
         ]),
         .init(heading: "Card", tokens: [
-            .init(label: "{card.label}", token: "{card.label}", description: "Removable volume name"),
+            .init(label: "{card.label}", token: "{card.label}", description: "Card (volume) or device name"),
         ]),
     ]
 }

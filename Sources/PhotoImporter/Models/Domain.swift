@@ -31,9 +31,73 @@ struct PhotoMeta: Hashable, Codable {
 
 struct PhotoFile: Identifiable, Hashable, Codable {
     var id: String { path.path }
+    /// A `file://` URL for a card; an `icdevice://` URL (see `DeviceCatalog`)
+    /// for a file on a connected iPhone or camera.
     var path: URL
     var sizeBytes: Int64
     var meta: PhotoMeta
+    /// Files imported together with this one rather than as rows of their
+    /// own — today only the video half of a Live Photo.
+    var companions: [CompanionFile] = []
+
+    /// Bytes the import will copy for this row, companions included.
+    var totalBytes: Int64 { companions.reduce(sizeBytes) { $0 &+ $1.sizeBytes } }
+}
+
+/// A file that travels with a photo instead of being matched against the
+/// template rules on its own. Its destination is the photo's *final*
+/// destination with `suffix` added to the stem and the companion's own
+/// extension, so a Live Photo lands as `IMG_000123.HEIC` +
+/// `IMG_000123_live.MOV` — and as `IMG_000123-2_live.MOV` if the photo itself
+/// had to be renamed on collision.
+struct CompanionFile: Hashable, Codable {
+    var path: URL
+    var sizeBytes: Int64
+    var suffix: String
+
+    static let livePhotoSuffix = "_live"
+    /// Sidecars such as `.AAE` keep the photo's exact stem.
+    static let sidecarSuffix = ""
+
+    var isLivePhotoVideo: Bool { suffix == Self.livePhotoSuffix }
+
+    /// Suffix for a sidecar of a photo named `photoStem`, so each sidecar of
+    /// one photo gets its own name next to the renamed photo:
+    /// - same stem (`IMG_5539.AAE`) → `""` — the photo's exact new name,
+    ///   which is what Photos needs to re-apply the edit;
+    /// - a marker inserted into the stem, as iOS does for its second edit
+    ///   record (`IMG_O5539.AAE`) → `"_O"`;
+    /// - anything else → `"_" + its own stem`, so it can't collide.
+    static func sidecarSuffix(photoStem: String, sidecarStem: String) -> String {
+        if sidecarStem.caseInsensitiveCompare(photoStem) == .orderedSame { return "" }
+        let p = Array(photoStem.lowercased()), s = Array(sidecarStem.lowercased())
+        if s.count > p.count {
+            var prefix = 0
+            while prefix < p.count && p[prefix] == s[prefix] { prefix += 1 }
+            var tail = 0
+            while tail < p.count - prefix && p[p.count - 1 - tail] == s[s.count - 1 - tail] { tail += 1 }
+            if prefix + tail == p.count {
+                let original = Array(sidecarStem)
+                return "_" + String(original[prefix..<(s.count - tail)])
+            }
+        }
+        return "_" + sidecarStem
+    }
+
+    /// Make every companion of one photo land on a distinct name: a second
+    /// one with the same suffix and extension gets `-2`, `-3`, ….
+    static func uniquified(_ companions: [CompanionFile]) -> [CompanionFile] {
+        var seen: [String: Int] = [:]
+        return companions.map { c in
+            let key = c.suffix.lowercased() + "." + c.path.pathExtension.lowercased()
+            let n = seen[key, default: 0] + 1
+            seen[key] = n
+            guard n > 1 else { return c }
+            var copy = c
+            copy.suffix += "-\(n)"
+            return copy
+        }
+    }
 }
 
 /// Broad buckets used by the template-rule filter dropdown. `all` catches
@@ -65,6 +129,13 @@ enum FileType: String, Codable, CaseIterable, Identifiable {
     static let videoExtensions: Set<String> = [
         "mov", "mp4", "m4v", "mts", "m2ts", "avi", "3gp",
     ]
+
+    /// Files that only mean something next to their photo or video, so they
+    /// are never matched by the rules on their own: they travel with it as a
+    /// companion and take its final name (`IMG_000123.HEIC` →
+    /// `IMG_000123.AAE`). `.aae` holds an iPhone edit (crop, filter, …) that
+    /// Photos re-applies to the original with the same base name.
+    static let sidecarExtensions: Set<String> = ["aae"]
 
     /// Union of every extension this app is willing to import. Drives the
     /// scanner's walk filter as well as rule matching.
@@ -225,6 +296,10 @@ struct ImportItem: Hashable {
     /// copied to this path after the primary write succeeds. Defaults to
     /// nil so existing callers (and tests) compile unchanged.
     var backupDst: URL? = nil
+    /// Copied right after this item, next to wherever it actually landed.
+    var companions: [CompanionFile] = []
+
+    var totalBytes: Int64 { companions.reduce(sizeBytes) { $0 &+ $1.sizeBytes } }
 }
 
 struct ImportPlan {
